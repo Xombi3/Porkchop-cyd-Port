@@ -1,6 +1,6 @@
 
                      [ CYD EDITION — ESP32-2432S028R ]
-Original project by 0ct0sec — ported to the Cheap Yellow Display by the community.
+Original project by 0ct0sec — ported to the Cheap Yellow Display by Xom
 
 --[ Contents
 
