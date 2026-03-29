@@ -707,6 +707,8 @@
         XPT2046_Touchscreen Paul Stoffregen
         ESP32 Arduino Core  Espressif Systems
         Unity Test          ThrowTheSwitch
+        NimBLE-Arduino      
+        
 
     This software is for educational and authorized testing only.
     You are responsible for how you use it.
