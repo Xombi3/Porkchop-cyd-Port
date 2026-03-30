@@ -1,0 +1,7 @@
+Using the Arduino IDE
+Open your sketch in the Arduino IDE.
+Select the correct board you are targeting (e.g., Arduino Uno, ESP32 Dev Module) by navigating to Tools > Board.
+Save your sketch if you haven't already.
+Go to the Sketch menu and select Export compiled Binary.
+Wait for the compilation process to complete. You can monitor the progress in the output console.
+Locate the generated .bin file in your sketch folder. You can find this folder by going to Sketch > Show Sketch Folder. A new file with the .bin extension will be available alongside your original .ino file. 
