@@ -1,5 +1,5 @@
 // ============================================================
-// M5PORKCHOP → CYD (ESP32-2432S028R) FAITHFUL PORT  v5
+// M5PORKCHOP → CYD (ESP32-2432S028R)
 // Original: https://github.com/0ct0sec/M5PORKCHOP by 0ct0
 // CYD Port: faithfully adapted from full source
 //
