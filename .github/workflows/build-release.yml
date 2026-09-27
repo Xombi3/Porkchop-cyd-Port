@@ -35,7 +35,7 @@ jobs:
         run: |
           # Compile the sketch and output binaries to the build directory
           arduino-cli compile \
-            --fqbn esp32:esp32:esp32:PartitionScheme=default,FlashMode=dio,FlashFreq=80,FlashSize=4M \
+            --fqbn esp32:esp32:esp32:PartitionScheme=huge_app,FlashMode=dio,FlashFreq=80,FlashSize=4M \
             --output-dir ./build \
             ./PorkChop_CYD
 
