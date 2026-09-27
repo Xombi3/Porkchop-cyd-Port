@@ -1,0 +1,80 @@
+name: Build Release Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for the release (e.g., v1.0.0)'
+        required: true
+        type: string
+      release_name:
+        description: 'Release title (optional, defaults to tag name)'
+        required: false
+        type: string
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 Core
+        run: |
+          arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          # Using version 3.0.4 as it is highly compatible with recent 3.x requirements
+          arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+
+      - name: Install Libraries
+        run: |
+          arduino-cli lib install "TFT_eSPI"
+          arduino-cli lib install "XPT2046_Touchscreen"
+          arduino-cli lib install "TinyGPSPlus"
+
+      - name: Configure TFT_eSPI
+        run: |
+          # Copy the custom User_Setup.h into the TFT_eSPI library directory
+          cp User_Setup.h ~/Arduino/libraries/TFT_eSPI/User_Setup.h
+
+      - name: Compile Sketch
+        run: |
+          # Compile the sketch and output binaries to the build directory
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32:PartitionScheme=huge_app,FlashMode=dio,FlashFreq=80,FlashSize=4M \
+            --output-dir ./build \
+            ./PorkChop_CYD
+
+      - name: Merge Binaries
+        run: |
+          pip install esptool
+          # Create a merged single .bin file for easier flashing
+          esptool.py --chip esp32 merge_bin \
+            -o ./build/PorkChop_CYD_Merged.bin \
+            --flash_mode dio \
+            --flash_freq 80m \
+            --flash_size 4MB \
+            0x1000 ./build/*.bootloader.bin \
+            0x8000 ./build/*.partitions.bin \
+            0x10000 ./build/PorkChop_CYD.ino.bin
+
+      - name: Upload Binaries to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PorkChop_CYD-Merged-Binary
+          path: ./build/PorkChop_CYD_Merged.bin
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag_name }}
+          name: ${{ github.event.inputs.release_name || github.event.inputs.tag_name }}
+          files: ./build/PorkChop_CYD_Merged.bin
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
