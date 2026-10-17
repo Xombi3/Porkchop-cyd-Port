@@ -17,6 +17,8 @@
 
 FLASH AVAILABLE AT https://espterminator.com/
 
+buymeacoffee.com/xombi3
+
 ---
 
 --[ Contents
