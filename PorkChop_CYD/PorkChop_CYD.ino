@@ -1,25 +1,31 @@
 // ============================================================
-// M5PORKCHOP → CYD (ESP32-2432S028R)  v5
+// M5PORKCHOP → Waveshare ESP32-C5-Touch-LCD-3.5
 // Original: https://github.com/0ct0sec/M5PORKCHOP by 0ct0
-// CYD Port: adapted from full source
+// CYD Port: Xombi3 (Porkchop-cyd-Port) — base this was ported from
+// C5 Port: adapted from the CYD source for the Waveshare C5 3.5 board
 //
-// Hardware: ESP32-2432S028R "Cheap Yellow Display" (Elegoo variant)
-//   ILI9341 2.8" 320x240 TFT  HSPI: MOSI=13 CLK=14 CS=15 DC=2 RST=-1
-//   XPT2046 touch              VSPI: CLK=25 MISO=39 MOSI=32 CS=33 IRQ=36
-//   Backlight GPIO 21 HIGH     RGB LED active-LOW: R=4 G=16 B=17
-//   SD card CS=5               GPS: RX=1 (Serial2) — NM-RF-HAT GNSS routing
+// Hardware: Waveshare ESP32-C5-Touch-LCD-3.5
+//   ST7796 3.5" 320x480 TFT  SPI: SCLK=6 MOSI=7 MISO=2 CS=8 DC=5 RST=expander
+//   FT6336 cap touch         I2C: SDA=27 SCL=26 (addr 0x38), polling
+//   LCD reset + backlight + panel power on I/O expander 0x24 (EXIO1/EXIO5)
+//   SD card CS=9 (shares the display SPI bus 6/7/2)
+//   GPS: Waveshare LC76G over I2C on the shared bus (SDA 27 / SCL 26, 0x50/0x54)
 //
-// Arduino IDE Board: ESP32 Dev Module
-//   Partition: Huge APP (3MB No OTA / 1MB SPIFFS)
+// Arduino IDE Board: ESP32-C5 Dev Module (ESP32 Arduino core 3.3.10)
+//   Partition: Huge APP (3MB No OTA / 1MB SPIFFS), PSRAM enabled
 //
 // Required Libraries:
-//   TFT_eSPI by Bodmer (configure with User_Setup.h)
-//   XPT2046_Touchscreen by Paul Stoffregen
-//   TinyGPSPlus by Mikal Hart
+//   TFT_eSPI by Bodmer (configure with the C5 User_Setup.h from this repo)
+//   FT6336 + I/O expander drivers are bundled: ft6336.h / ws_c5_exio.h
 // ============================================================
 
 #include <TFT_eSPI.h>
-#include <XPT2046_Touchscreen.h>
+#include <Wire.h>
+#include <ESP_I2S.h>      // I2S master TX for the onboard audio chain
+#include "ws_c5_exio.h"   // Waveshare C5 I/O expander (0x24): power, LCD/touch reset, backlight
+#include "ft6336.h"       // FT6336 capacitive touch (I2C 0x38) + C5 per-read bus fix
+#include "es8311.h"       // ES8311 audio codec (I2C 0x18) DAC init — I2S->ES8311->NS4150B->speaker
+#include "gps_i2c.h"      // LC76G GNSS over I2C (0x50/0x54) on the shared bus
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_wifi.h>
@@ -47,44 +53,50 @@
 #include <atomic>
 // PIGGY BLUES uses stub on CYD — BLE stack incompatible with sprite memory budget
 
-// Optional GPS
+// GPS — ENABLED. Waveshare LC76G Multi-GNSS over I2C on the J3 header's SDA/SCL
+// (shared with touch/codec/expander): GPS SDA -> J3 SDA, GPS SCL -> J3 SCL,
+// VCC -> 3V3, GND -> G. The J3 UART hole (U0RXD/GPIO12) does NOT reach the chip
+// on this board as shipped (verified on two units), so the module's UART is
+// unused. Protocol + recovery/wake follow Waveshare's LC76G I2C demo; see
+// gps_i2c.h. Verified: 12-sat fix with touch working alongside.
 #define GPS_ENABLED true
 #if GPS_ENABLED
   #include <TinyGPS++.h>
 #endif
 
 // ============================================================
-// CYD PIN DEFINITIONS
+// WAVESHARE C5 3.5 PIN DEFINITIONS
+// Display SPI (SCLK 6 / MOSI 7 / MISO 2 / CS 8 / DC 5) lives in User_Setup.h.
+// LCD reset, backlight and panel power are on the I/O expander 0x24, not a
+// GPIO (see ws_c5_exio.h) — so there is no TFT_BL_PIN here.
 // ============================================================
-#define TFT_BL_PIN    21   // Backlight (active HIGH)
-#define LED_R_PIN     4    // RGB LED Red (active LOW)
-#define LED_G_PIN     16   // RGB LED Green (active LOW)
-#define LED_B_PIN     17   // RGB LED Blue (active LOW)
-#define SD_CS_PIN     5
-#define SPEAKER_PIN   26   // CYD speaker connector (P3/CN1) via GPIO 26
+// RGB LED: DISABLED (-1). The CYD's LED was on GPIO 4/16/17, but on the
+// ESP32-C5 GPIO 16/17 are the internal MSPI flash/PSRAM pins — the Arduino
+// core treats them as "valid" (< SOC_GPIO_PIN_COUNT) and actually drives
+// them, which corrupts flash/PSRAM access and hard-locks the CPU (CPU_LOCKUP
+// bootloop, screen never comes up). There is no RGB LED on this board anyway.
+// -1 (=255) makes every pinMode/digitalWrite on these pins a safe no-op.
+#define LED_R_PIN     -1
+#define LED_G_PIN     -1
+#define LED_B_PIN     -1
+#define SD_CS_PIN     9    // microSD CS; SD shares the display SPI bus (6/7/2)
 
-// Touch (VSPI)
-#define TOUCH_CS_PIN  33
-#define TOUCH_IRQ_PIN 36
-#define TOUCH_CLK_PIN 25
-#define TOUCH_MISO_PIN 39
-#define TOUCH_MOSI_PIN 32
+// Speaker: DISABLED. The CYD drove a speaker on GPIO 26, but on the C5 GPIO 26
+// is the capacitive-touch I2C clock (SCL). -1 keeps the SFX code compiled but
+// inert (ledc is never attached), freeing GPIO 26 for touch.
+#define SPEAKER_PIN   -1
 
-// GPS (Serial2) - optional
-// NM-RF-HAT routes the GNSS module's NMEA output onto GPIO 1.
-// (Bare-CYD UART-connector mods use GPIO 3; Bruce's generic default is 22.)
-#define GPS_RX_PIN     1   // GPIO 1 = NM-RF-HAT GPS data in  (was 3 on bare CYD)
-#define GPS_TX_PIN    -1   // not needed — Porkchop never transmits to the GPS
-#define GPS_BAUD      9600 // ATGM336H / most CYD GNSS modules. Try 38400 if no fix.
+// Capacitive touch (FT6336) is I2C — bus pins live in ws_c5_exio.h (SDA 27 /
+// SCL 26). No SPI touch chip on this board.
 
 // ============================================================
-// DISPLAY LAYOUT  (320x240 landscape — scaled from 240x135)
-// Original used 240×135 with TOP_BAR=14, BOTTOM_BAR=14, MAIN=107
-// CYD: we scale proportionally to 320×240:
-//   TOP_BAR=20, BOTTOM_BAR=20, MAIN=200
+// DISPLAY LAYOUT  (Phase 2: full 480x320 landscape)
+// The UI now fills the whole C5 panel. Most layout is DISPLAY_W/DISPLAY_H/
+// MAIN_H-relative and reflows automatically; per-screen tuned constants
+// (spectrum, some Y offsets) are being migrated screen-by-screen.
 // ============================================================
-#define DISPLAY_W     320
-#define DISPLAY_H     240
+#define DISPLAY_W     480
+#define DISPLAY_H     320
 #define TOP_BAR_H     20
 #define BOTTOM_BAR_H  20
 #define MAIN_H        (DISPLAY_H - TOP_BAR_H - BOTTOM_BAR_H)
@@ -248,21 +260,62 @@ const uint8_t CHICKEN_DOWN[] PROGMEM = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
 // GLOBAL INSTANCES
 // ============================================================
 TFT_eSPI tft = TFT_eSPI();
+
+// Onboard audio: I2S master → ES8311 codec → NS4150B amp → speaker.
+// I2S pins (C5): BCLK 23, LRCK/WS 10, DOUT(DAC) 25; no MCLK (codec clocks off SCLK).
+I2SClass audioI2S;
+#define AUD_BCLK 23
+#define AUD_LRCK 10
+#define AUD_DOUT 25
+#define AUD_RATE 16000
+static bool audioReady = false;
+
+// Shared current-tone state, written by SFX (SFX::_tone) and read by the audio
+// task. The SFX sequencer stays unchanged — it just sets the tone here instead
+// of toggling ledc PWM.
+static volatile int _audFreq = 0;   // Hz, 0 = silence
+static volatile int _audAmp  = 0;   // 0..32767
+static inline void audioSetTone(int freqHz, int amp) { _audFreq = freqHz; _audAmp = amp; }
+
+// Continuous I2S render task: emits the current tone (or silence) as 16-bit
+// stereo PCM. i2s write() blocks on DMA space, which paces this at AUD_RATE, so
+// it costs ~no CPU when idle and never blocks the UI loop. The onboard ES8311
+// amp needs a steady stream, so we always write (silence when no tone).
+static void audioTask(void*) {
+  static int16_t buf[128 * 2];
+  float ph = 0;
+  for (;;) {
+    int f = _audFreq, a = _audAmp;
+    if (f > 0 && a > 0) {
+      float dph = 2.0f * PI * f / AUD_RATE;
+      for (int i = 0; i < 128; i++) {
+        // Sine tone (cleaner/softer than the CYD's square-wave PWM).
+        // For a harsher retro square instead: s = (ph < PI) ? a : -a;
+        int16_t s = (int16_t)(sinf(ph) * a);
+        ph += dph; if (ph > 2.0f * PI) ph -= 2.0f * PI;
+        buf[i * 2] = s; buf[i * 2 + 1] = s;
+      }
+    } else {
+      // Idle: don't hog the CPU streaming silence (single-core — the UI loop
+      // and touch task need the time). Sleep; DMA underruns to silence.
+      ph = 0;
+      vTaskDelay(pdMS_TO_TICKS(8));
+      continue;
+    }
+    audioI2S.write((uint8_t*)buf, sizeof(buf));
+  }
+}
 TFT_eSprite mainSprite = TFT_eSprite(&tft); // Main content area sprite
 
-// Touch on custom VSPI pins (CLK=25, MISO=39, MOSI=32, CS=33)
-SPIClass touchSPI(VSPI);
-// SD also uses VSPI but on different pins (18/19/23/5)
-// We must reclaim the VSPI bus before each SD operation since touchSPI shares it
-SPIClass sdSPI(VSPI);
-// SD bus reclaim — restores VSPI pins and re-registers SD after touchSPI reconfigures VSPI
-// Call before any SD operation that happens after touch init
-#define SD_RECLAIM() do { sdSPI.begin(18, 19, 23, SD_CS_PIN); SD.begin(SD_CS_PIN, sdSPI, 20000000); } while(0)
-XPT2046_Touchscreen touch(TOUCH_CS_PIN, TOUCH_IRQ_PIN);
+// Touch is FT6336 over I2C (ft6336.h) — no SPI touch object on the C5.
 
-// SD uses the default Arduino SPI object (VSPI default pins: CLK=18, MISO=19, MOSI=23, CS=5)
-// This avoids conflicting with touchSPI which has been re-pinned to 25/39/32
-// No SPIClass needed — SD.begin() uses SPI directly
+// SD shares the display SPI bus (SCLK 6 / MISO 2 / MOSI 7, CS 9) on its own
+// SPI instance that TFT_eSPI itself uses (tft.getSPIinstance()). On the C5 the
+// SD and the ST7796 share one physical SPI bus, so SD MUST use TFT's own
+// instance and must NEVER begin()/end() a competing SPIClass on those pins —
+// ending it tears down the live display bus and blanks the panel (that was the
+// dark-screen bug). This mirrors Marauder's shared-bus setup (no .end()).
+#define SD_RECLAIM() do { SD.begin(SD_CS_PIN, tft.getSPIinstance(), 20000000); } while(0)
 
 #if GPS_ENABLED
 TinyGPSPlus gps;
@@ -296,7 +349,7 @@ struct Config {
   char wpasecKey[48]     = "";   // WPA-SEC key         (wpa-sec.stanev.org/?show_key)
   // ──────────────────────────────────────────────────────────────
   bool soundEnabled    = true;
-  uint8_t soundVolume  = 255;  // 0-255 PWM duty, 255=max
+  uint8_t soundVolume  = 120;  // 0-255 I2S amplitude scale (was 255/max — too loud on the onboard amp)
   bool ghostMode       = false; // MAC randomization
   uint8_t ghostInterval = 5;   // minutes between MAC rotations (1-60)
   uint8_t screenRotation = 3;  // TFT_eSPI rotation value — 1 or 3 (180deg apart, both landscape)
@@ -315,12 +368,16 @@ static uint8_t menuSel    = 0;  // Menu selected row (absolute index)
 static uint8_t capPageIdx = 0;  // CAPTURES screen: 0=loot, 1=challenges, 2=quick crack
 
 // ── HOG ON SPECTRUM — state (static, no heap) ─────────────────────────────
-#define SPEC_W        280    // spectrum draw width (px), starts at x=20
-#define SPEC_LEFT     20     // left margin for dB labels
-#define SPEC_TOP      0      // top of spectrum area (in sprite)
-#define SPEC_BOT      110    // bottom of spectrum (baseline)
-#define WFALL_ROWS    40     // waterfall history rows
-#define WFALL_TOP     112    // waterfall top (in sprite)
+// Phase 2: sized for the full 480x280 main sprite. SPEC_W fills to the right
+// edge; the spectrum takes the top ~180px and the waterfall the rest. (All
+// spectrum draw code uses these defines, so it follows automatically.)
+#define SPEC_LEFT     20                   // left margin for dB labels
+#define SPEC_W        (DISPLAY_W-SPEC_LEFT)// spectrum draw width (px) — fills to the right edge
+#define SPEC_TOP      0                    // top of spectrum area (in sprite)
+#define SPEC_BOT      180                  // bottom of spectrum / baseline (in sprite)
+#define WFALL_TOP     196                  // waterfall top (in sprite)
+#define WFALL_ROWS    40                   // waterfall history rows (buffer stays small)
+#define WFALL_RH      2                    // px per waterfall row — 40*2=80px, ends at 276 < 280
 static const float SINC_LUT[45] = {
   0.0000f,0.0650f,0.1100f,0.1300f,0.1100f, 0.0650f,0.0000f,0.0900f,0.1500f,0.1800f,
   0.1500f,0.0000f,0.1700f,0.2700f,0.3300f, 0.3700f,0.5000f,0.6500f,0.8000f,0.9100f,
@@ -856,18 +913,16 @@ static volatile uint8_t _qH = 0, _qT = 0;
 
 static bool _ledcInited = false;
 
+// C5: route tones to the I2S->ES8311 audio task instead of ledc PWM. The
+// audio task renders _audFreq/_audAmp continuously; here we just set them.
 static void _tone(uint16_t freq) {
-  if (!cfg.soundEnabled || !_ledcInited) return;
-  if (freq == 0) { ledcWrite(SPEAKER_PIN, 0); return; }
-  ledcChangeFrequency(SPEAKER_PIN, freq, 10);
-  // 50% duty (512/1023) = true square wave = maximum symmetric swing through AC coupling cap
-  // soundVolume 0-255 maps to 256-512 (never below 25% to maintain oscillation)
-  uint16_t duty = 256 + (uint16_t)(cfg.soundVolume * 256UL / 255);
-  if (duty > 512) duty = 512;  // never above 50% — above 50% reduces output
-  ledcWrite(SPEAKER_PIN, duty);
+  if (!cfg.soundEnabled || !audioReady || freq == 0) { audioSetTone(0, 0); return; }
+  // soundVolume 0-255 -> amplitude, with headroom below full-scale (32767).
+  int amp = 2000 + (int)(cfg.soundVolume * 10000UL / 255);
+  audioSetTone((int)freq, amp);
 }
 static void _noTone() {
-  if (_ledcInited) ledcWrite(SPEAKER_PIN, 0);
+  audioSetTone(0, 0);
 }
 
 static void _startSeq(const Note* seq) {
@@ -879,7 +934,9 @@ static void _startSeq(const Note* seq) {
 void init() {
   // 10-bit resolution gives 0-1023 range — more precise duty control
   // NS4168 amp: IN+ is AC-coupled, 50% duty = max symmetric swing
-  if (ledcAttach(SPEAKER_PIN, 1000, 10)) {
+  // On the C5, SPEAKER_PIN is -1 (no speaker; GPIO 26 is the touch I2C clock),
+  // so skip ledcAttach entirely — _ledcInited stays false and all SFX no-op.
+  if (SPEAKER_PIN >= 0 && ledcAttach(SPEAKER_PIN, 1000, 10)) {
     ledcWrite(SPEAKER_PIN, 0);
     _ledcInited = true;
     Serial.println("[SFX] ledc attached OK");
@@ -3342,8 +3399,11 @@ void init() {
   // the pig UI. If you ever want richer gradients back, change 8 -> 16 (and
   // accept the WARHOG crash risk returns unless memory is freed elsewhere).
   mainSprite.setColorDepth(8);
-  if (mainSprite.createSprite(DISPLAY_W, 160)) {
-    Serial.println("[DISPLAY] Sprite 320x160 8bpp OK");
+  // Full main-area sprite (DISPLAY_W x MAIN_H). On the C5 TFT_eSPI allocates
+  // sprites in PSRAM (psramFound + _psram_enable), so this ~134KB buffer does
+  // NOT come out of internal heap — no WARHOG-era fragmentation risk here.
+  if (mainSprite.createSprite(DISPLAY_W, MAIN_H)) {
+    Serial.printf("[DISPLAY] Sprite %dx%d 8bpp OK\n", DISPLAY_W, MAIN_H);
   } else {
     Serial.println("[DISPLAY] Sprite alloc failed — direct draw mode");
   }
@@ -3891,7 +3951,13 @@ void update() {
         dst.setTextSize(1);
         const int rowH = 11;
         const int listY = yOff + 20;
-        const int visRows = 13;  // how many rows fit
+        // Rows that fit the available content height (sprite height when drawing
+        // to the sprite, else MAIN_H). On the 480x320 panel this shows all items
+        // without scrolling; on a smaller layout it falls back to a scroll window.
+        int availH = (sprH > 0) ? sprH : MAIN_H;
+        int visRows = (availH - 20) / rowH;
+        if (visRows > MENU_COUNT) visRows = MENU_COUNT;
+        if (visRows < 1) visRows = 1;
         // Keep selected item visible — scroll window
         int scrollStart = menuSel - visRows/2;
         if (scrollStart < 0) scrollStart = 0;
@@ -4145,7 +4211,7 @@ void update() {
         dst.drawFastHLine(SPEC_LEFT, yOff+WFALL_TOP-2, SPEC_W, colorFG());
         for (int row=0;row<WFALL_ROWS;row++) {
           int bufRow=(wfallRow+row)%WFALL_ROWS;
-          int sy=yOff+WFALL_TOP+row;
+          int sy=yOff+WFALL_TOP+row*WFALL_RH;
           if(sy>=yOff+MAIN_H-10) break;
           for (int x=0;x<SPEC_W;x++) {
             uint8_t inten=wfallBuf[bufRow][x];
@@ -4156,26 +4222,34 @@ void update() {
             else if(inten>100)  draw=(x%2==0)&&(row%2==0);
             else if(inten>50)   draw=(x%3==0)&&(row%2==0);
             else                draw=(x%4==0)&&(row%3==0);
-            if(draw) dst.drawPixel(SPEC_LEFT+x, sy, colorFG());
+            if(draw) dst.drawFastVLine(SPEC_LEFT+x, sy, WFALL_RH, colorFG());
           }
         }
         // Selected network highlight + info
         if (specSelIdx>=0) {
+          // Copy the selected network's fields under the lock, then draw
+          // OUTSIDE it (snprintf/drawString take locks and abort in a spinlock).
+          uint8_t hCh=0; int8_t hRssi=0; char hSsid[33]={0}; bool hValid=false;
           NetworkRecon::enterCritical();
-          auto& hn=NetworkRecon::getNetworks();
-          if(specSelIdx<(int)hn.size()) {
-            float hf=2412.0f+(hn[specSelIdx].channel-1)*5.0f;
+          {
+            auto& hn=NetworkRecon::getNetworks();
+            if(specSelIdx<(int)hn.size()) {
+              hCh=hn[specSelIdx].channel; hRssi=hn[specSelIdx].rssi;
+              strncpy(hSsid, hn[specSelIdx].ssid, 32); hValid=true;
+            }
+          }
+          NetworkRecon::exitCritical();
+          if(hValid) {
+            float hf=2412.0f+(hCh-1)*5.0f;
             int hx=specFreqToX(hf,specViewCtr);
             if(hx>=SPEC_LEFT&&hx<SPEC_LEFT+SPEC_W) {
               dst.drawFastVLine(hx, yOff+SPEC_TOP, SPEC_BOT-SPEC_TOP, colorFG()&0x7BEF);
               char si[48]; snprintf(si,sizeof(si),"%.16s %ddB CH%d",
-                hn[specSelIdx].ssid[0]?hn[specSelIdx].ssid:"<hidden>",
-                hn[specSelIdx].rssi, hn[specSelIdx].channel);
+                hSsid[0]?hSsid:"<hidden>", hRssi, hCh);
               dst.setTextDatum(TL_DATUM);
               dst.drawString(si, SPEC_LEFT+2, yOff+2);
             }
           }
-          NetworkRecon::exitCritical();
         }
         // Hints
         dst.setTextDatum(TC_DATUM);
@@ -4531,7 +4605,7 @@ void update() {
         dst.setTextSize(1);
         dst.drawString("by 0ct0sec", DISPLAY_W/2, yOff+34);
         dst.drawString("github.com/0ct0sec/M5PORKCHOP", DISPLAY_W/2, yOff+50);
-        dst.drawString("CYD port - TFT_eSPI + ESP32", DISPLAY_W/2, yOff+66);
+        dst.drawString("C5 port - ST7796 + ESP32-C5", DISPLAY_W/2, yOff+66);
         dst.drawLine(20, yOff+84, DISPLAY_W-20, yOff+84, colorFG());
         dst.setTextSize(1);
         char qb[48]; snprintf(qb,sizeof(qb),"\"%s\"", quotes[Display::aboutQuoteIdx%12]);
@@ -4954,7 +5028,7 @@ void update() {
           // W1GL3 tab — stub (CYD has no WiGLE upload)
           dst.setTextSize(1); dst.setTextDatum(TC_DATUM);
           dst.drawString("W1GL3 ST4TS", DISPLAY_W/2, tabY+40);
-          dst.drawString("N0 W1GL3 ON CYD", DISPLAY_W/2, tabY+60);
+          dst.drawString("N0 W1GL3 ON C5", DISPLAY_W/2, tabY+60);
           dst.drawString("(no upload feature)", DISPLAY_W/2, tabY+76);
         }
         dst.setTextDatum(TC_DATUM);
@@ -5338,14 +5412,14 @@ void update() {
         mainSprite.setTextDatum(TC_DATUM);
         mainSprite.setTextColor(colorFG(), colorBG());
         mainSprite.setTextSize(1);
-        mainSprite.drawString("PORKCHOP CYD", DISPLAY_W/2, MAIN_H/2-10);
+        mainSprite.drawString("PORKCHOP C5", DISPLAY_W/2, MAIN_H/2-10);
         mainSprite.setTextSize(1);
         mainSprite.drawString(Mood::getCurrentPhrase(), DISPLAY_W/2, MAIN_H/2+14);
       } else {
         tft.setTextDatum(TC_DATUM);
         tft.setTextColor(colorFG(), colorBG());
         tft.setTextSize(1);
-        tft.drawString("PORKCHOP CYD", DISPLAY_W/2, TOP_BAR_H+MAIN_H/2-10);
+        tft.drawString("PORKCHOP C5", DISPLAY_W/2, TOP_BAR_H+MAIN_H/2-10);
         tft.setTextSize(1);
         tft.drawString(Mood::getCurrentPhrase(), DISPLAY_W/2, TOP_BAR_H+MAIN_H/2+14);
       }
@@ -5581,29 +5655,45 @@ void showBootSplash() {
 // ============================================================
 namespace Touch {
 
-#define TOUCH_HOLD_MS   800
-#define TOUCH_DEBOUNCE  150
+#define TOUCH_HOLD_MS   700
+#define TOUCH_DEBOUNCE  20    // min contact (ms) for a tap — low so light/quick taps register
+#define TOUCH_RELEASE_MISS 2  // consecutive no-touch reads before declaring release
+                              // (rides over a single flaky FT6336 read mid-touch)
 
 uint32_t touchStart = 0;
 bool touching = false;
 bool holdFired = false;
 int lastTX = 0, lastTY = 0;
+uint8_t missCount = 0;   // consecutive no-touch reads (for release debouncing)
 
-// Map raw touch coords to screen coords (calibrate per unit if needed)
-// These values are for typical Elegoo CYD units — adjust if needed
-#define T_XMIN 340
-#define T_XMAX 3800
-#define T_YMIN 250
-#define T_YMAX 3750
-
+// FT6336 reports pixel coordinates in the panel's native portrait space
+// (0..TFT_WIDTH-1 x 0..TFT_HEIGHT-1 = 0..319 x 0..479) — no analog calibration
+// like the XPT2046 needed. We rotate those into the UI's landscape logical
+// space (DISPLAY_W x DISPLAY_H, top-left of the 480x320 canvas) to match the
+// display rotation. PorkChop only uses rotations 1 and 3 (both landscape).
+//
+// NOTE: the exact rotation + axis flips are a hardware-verify item on first
+// bring-up — if taps land mirrored or on the wrong axis, this transform is the
+// one place to adjust.
 bool getPoint(int& sx, int& sy) {
-  if (!touch.tirqTouched() && !touch.touched()) return false;
-  TS_Point p = touch.getPoint();
-  // Map to screen (landscape, rotation=1)
-  sx = map(p.x, T_XMIN, T_XMAX, 0, DISPLAY_W);
-  sy = map(p.y, T_YMIN, T_YMAX, 0, DISPLAY_H);
-  sx = constrain(sx, 0, DISPLAY_W-1);
-  sy = constrain(sy, 0, DISPLAY_H-1);
+  uint16_t px, py;                       // panel-native portrait coords
+  if (!ft6336_read_raw(&px, &py)) return false;
+
+  int lx, ly;                            // landscape logical coords
+  if (cfg.screenRotation == 3) {
+    lx = (TFT_HEIGHT - 1) - py;          // 0..479
+    ly = px;                             // 0..319
+  } else { // rotation 1
+    lx = py;                             // 0..479
+    ly = (TFT_WIDTH - 1) - px;           // 0..319
+  }
+
+  // The UI occupies only the top-left DISPLAY_W x DISPLAY_H of the panel.
+  // Reject touches in the unused border so they can't register as edge taps.
+  if (lx < 0 || ly < 0 || lx >= DISPLAY_W || ly >= DISPLAY_H) return false;
+
+  sx = lx;
+  sy = ly;
   return true;
 }
 
@@ -5613,12 +5703,13 @@ uint8_t update(int& tx, int& ty) {
   bool isTouched = getPoint(sx, sy);
 
   if (isTouched) {
+    missCount = 0;
     if (!touching) {
       touching = true;
       holdFired = false;
       touchStart = millis();
-      lastTX = sx; lastTY = sy;
     }
+    lastTX = sx; lastTY = sy;
     tx = sx; ty = sy;
     if (!holdFired && millis() - touchStart >= TOUCH_HOLD_MS) {
       holdFired = true;
@@ -5626,7 +5717,14 @@ uint8_t update(int& tx, int& ty) {
     }
   } else {
     if (touching) {
+      // Ride over a transient dropped read — only treat as released after a
+      // few consecutive misses, so one flaky FT6336 read doesn't end the tap.
+      if (++missCount < TOUCH_RELEASE_MISS) {
+        tx = lastTX; ty = lastTY;
+        return 0;  // still considered touching
+      }
       touching = false;
+      missCount = 0;
       if (!holdFired && millis() - touchStart >= TOUCH_DEBOUNCE) {
         tx = lastTX; ty = lastTY;
         return 1;  // tap
@@ -5637,6 +5735,34 @@ uint8_t update(int& tx, int& ty) {
 }
 
 } // namespace Touch
+
+// ── Touch polling task ──────────────────────────────────────────────────────
+// Poll the FT6336 + run the tap/hold state machine at a FIXED ~100Hz, decoupled
+// from the render loop (which slowed down with the full-screen Phase-2 sprite).
+// Latches the most recent tap/hold event for handleInput() to consume once.
+static volatile uint8_t _touchEvt = 0;   // 0=none,1=tap,2=hold (latched)
+static volatile int      _touchX = 0, _touchY = 0;
+static portMUX_TYPE       _touchMux = portMUX_INITIALIZER_UNLOCKED;
+static void touchTask(void*) {
+  for (;;) {
+    int tx = 0, ty = 0;
+    uint8_t e = Touch::update(tx, ty);
+    if (e) {
+      taskENTER_CRITICAL(&_touchMux);
+      _touchEvt = e; _touchX = tx; _touchY = ty;
+      taskEXIT_CRITICAL(&_touchMux);
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));  // ~100Hz — snappy regardless of render rate
+  }
+}
+// Consume the latched touch event (0 if none). Called from handleInput().
+static uint8_t touchPoll(int& tx, int& ty) {
+  uint8_t e = 0;
+  taskENTER_CRITICAL(&_touchMux);
+  if (_touchEvt) { e = _touchEvt; tx = _touchX; ty = _touchY; _touchEvt = 0; }
+  taskEXIT_CRITICAL(&_touchMux);
+  return e;
+}
 
 // ============================================================
 // EASTER EGG: PARTY PIG gesture tracker
@@ -7900,17 +8026,27 @@ static void _processPending() {
 // ── selectTarget ─────────────────────────────────────────────
 static void _selectTarget(int idx) {
   _tgtIdx = idx;
+  // Copy target fields under the lock; do channel set + snprintf/Serial/Mood
+  // OUTSIDE it (those take locks and abort inside a spinlock).
+  uint8_t tCh=0; char tSsid[33]={0}; bool tValid=false;
   NetworkRecon::enterCritical();
-  auto& nets = NetworkRecon::getNetworks();
-  if (idx >= 0 && idx < (int)nets.size()) {
-    memcpy(_tgtBssid, nets[idx].bssid, 6);
-    _setChannel(nets[idx].channel);
-    char msg[48];
-    snprintf(msg, sizeof(msg), "LOCKED: %s CH%d", nets[idx].ssid, nets[idx].channel);
-    Mood::setStatusMessage(msg);
-    Serial.printf("[OINK] Target: %s CH%d\n", nets[idx].ssid, nets[idx].channel);
+  {
+    auto& nets = NetworkRecon::getNetworks();
+    if (idx >= 0 && idx < (int)nets.size()) {
+      memcpy(_tgtBssid, nets[idx].bssid, 6);
+      tCh = nets[idx].channel;
+      strncpy(tSsid, nets[idx].ssid, 32);
+      tValid = true;
+    }
   }
   NetworkRecon::exitCritical();
+  if (tValid) {
+    _setChannel(tCh);
+    char msg[48];
+    snprintf(msg, sizeof(msg), "LOCKED: %s CH%d", tSsid, tCh);
+    Mood::setStatusMessage(msg);
+    Serial.printf("[OINK] Target: %s CH%d\n", tSsid, tCh);
+  }
 }
 
 // ── Public API ───────────────────────────────────────────────
@@ -8691,7 +8827,7 @@ float getPeakSpeedKmh()   { return _peakSpeedKmh; }
 namespace PiggyBlues {
   static uint32_t _totalPkts = 0;
   static bool _running = false;
-  void start()  { Display::showToast("BLUES: N/A ON CYD",2000); }
+  void start()  { Display::showToast("BLUES: N/A ON C5",2000); }
   void stop()   { _running = false; }
   void update() {}
   bool isRunning()     { return false; }
@@ -9157,27 +9293,36 @@ static void IRAM_ATTR _mgmtCallback(wifi_promiscuous_pkt_t* pkt, wifi_promiscuou
 
 // ── Evil twin scan ───────────────────────────────────────────
 static void _scanEvilTwins() {
+  // Snapshot the list under the lock, then detect + log OUTSIDE it
+  // (Serial/SFX take locks and abort inside the _mux spinlock).
+  static DetectedNetwork cp[MAX_RECON_NETS];
+  size_t cpN;
   NetworkRecon::enterCritical();
-  const auto& nets = NetworkRecon::getNetworks();
-  int n = (int)nets.size();
+  {
+    const auto& src = NetworkRecon::getNetworks();
+    cpN = src.size(); if (cpN > MAX_RECON_NETS) cpN = MAX_RECON_NETS;
+    for (size_t i=0;i<cpN;i++) cp[i]=src[i];
+  }
+  NetworkRecon::exitCritical();
+  int n = (int)cpN;
   for (int i=0; i<n; i++) {
-    if (!nets[i].ssid[0]) continue;  // skip hidden
+    if (!cp[i].ssid[0]) continue;  // skip hidden
     for (int j=i+1; j<n; j++) {
-      if (!nets[j].ssid[0]) continue;
-      if (strcmp(nets[i].ssid, nets[j].ssid) != 0) continue;
+      if (!cp[j].ssid[0]) continue;
+      if (strcmp(cp[i].ssid, cp[j].ssid) != 0) continue;
       // Same SSID — check if already recorded
       bool known = false;
       for (uint8_t k=0; k<_twinCount; k++)
-        if (strcmp(_twins[k].ssid, nets[i].ssid)==0) { known=true; break; }
+        if (strcmp(_twins[k].ssid, cp[i].ssid)==0) { known=true; break; }
       if (known || _twinCount >= 8) continue;
       EvilTwin& t = _twins[_twinCount++];
-      strncpy(t.ssid, nets[i].ssid, 32); t.ssid[32]=0;
-      memcpy(t.bssid1, nets[i].bssid, 6);
-      memcpy(t.bssid2, nets[j].bssid, 6);
-      t.auth1 = (uint8_t)nets[i].authmode;
-      t.auth2 = (uint8_t)nets[j].authmode;
-      t.rssi1 = nets[i].rssi;
-      t.rssi2 = nets[j].rssi;
+      strncpy(t.ssid, cp[i].ssid, 32); t.ssid[32]=0;
+      memcpy(t.bssid1, cp[i].bssid, 6);
+      memcpy(t.bssid2, cp[j].bssid, 6);
+      t.auth1 = (uint8_t)cp[i].authmode;
+      t.auth2 = (uint8_t)cp[j].authmode;
+      t.rssi1 = cp[i].rssi;
+      t.rssi2 = cp[j].rssi;
       t.seenAt = millis();
       Serial.printf("[SNOUT] EVIL TWIN: '%s' [%02X:%02X:%02X] vs [%02X:%02X:%02X]\n",
         t.ssid, t.bssid1[3],t.bssid1[4],t.bssid1[5],
@@ -9186,7 +9331,6 @@ static void _scanEvilTwins() {
       Mood::setStatusMessage("EVIL TWIN!");
     }
   }
-  NetworkRecon::exitCritical();
 }
 
 // ── Send directed probe request ──────────────────────────────
@@ -9212,11 +9356,20 @@ static void _sendProbe(const uint8_t* bssid, uint8_t channel, const uint8_t* src
 // Called from beacon drain — if a hidden net sends a probe response,
 // its SSID will appear in subsequent beacons via NetworkRecon
 static void _checkRevealedHidden() {
+  // Snapshot under the lock, then reveal + log OUTSIDE it.
+  static DetectedNetwork cp[MAX_RECON_NETS];
+  size_t cpN;
   NetworkRecon::enterCritical();
-  const auto& nets = NetworkRecon::getNetworks();
+  {
+    const auto& src = NetworkRecon::getNetworks();
+    cpN = src.size(); if (cpN > MAX_RECON_NETS) cpN = MAX_RECON_NETS;
+    for (size_t i=0;i<cpN;i++) cp[i]=src[i];
+  }
+  NetworkRecon::exitCritical();
   for (uint8_t i=0; i<_hiddenCount; i++) {
     if (_hidden[i].revealed) continue;
-    for (const auto& n : nets) {
+    for (size_t ni=0; ni<cpN; ni++) {
+      const DetectedNetwork& n = cp[ni];
       if (memcmp(n.bssid, _hidden[i].bssid, 6)==0 && n.ssid[0]) {
         strncpy(_hidden[i].ssid, n.ssid, 32);
         _hidden[i].revealed = true;
@@ -9227,7 +9380,6 @@ static void _checkRevealedHidden() {
       }
     }
   }
-  NetworkRecon::exitCritical();
 }
 
 // ── Populate hidden list from NetworkRecon ───────────────────
@@ -9481,7 +9633,7 @@ void sessionStart() {
   }
   if (!_logFile) { Serial.println("[TALES] log open failed — check SD card"); return; }
   _open = true;
-  const char* hdr1 = "=== PORKCHOP CYD — WAR TALE ===\n";
+  const char* hdr1 = "=== PORKCHOP C5 — WAR TALE ===\n";
   _logFile.write((const uint8_t*)hdr1, strlen(hdr1));
   char hdr[64];
   snprintf(hdr, sizeof(hdr), "Session start | LVL:%d XP:%lu", XP::getLevel(), XP::getTotalXP());
@@ -9538,6 +9690,8 @@ struct HostileContact {
   int8_t  rssi;
   uint32_t firstSeen, lastSeen;
   uint16_t seenCount;
+  bool     logged;    // false until update() has logged it (deferred from the
+                      // promiscuous callback, where Serial/SD I/O is unsafe)
 };
 static HostileContact _hostiles[8];
 static uint8_t        _hostileCount = 0;
@@ -9674,8 +9828,10 @@ static void IRAM_ATTR _radarCallback(wifi_promiscuous_pkt_t* pkt, wifi_promiscuo
           else strncpy(h.detail,"(no name)",47);
         } else strncpy(h.detail,"(no name)",47);
         h.rssi=pkt->rx_ctrl.rssi; h.firstSeen=h.lastSeen=millis(); h.seenCount=1;
-        Serial.printf("[RADAR] PWNAGOTCHI: %s rssi=%d\n", h.detail, h.rssi);
-        WarTales::logDetection("PWNAGOTCHI", h.detail);
+        // NOTE: this runs in the IRAM_ATTR promiscuous callback — Serial and SD
+        // I/O take locks and abort() here. Defer them: update() logs any hostile
+        // whose `logged` flag is still false (see below).
+        h.logged = false;
       }
     }
   }
@@ -9701,7 +9857,16 @@ static void IRAM_ATTR _radarCallback(wifi_promiscuous_pkt_t* pkt, wifi_promiscuo
       }
     DroneContact& d = _drones[_droneCount++];
     memcpy(d.mac, p+10, 6);
-    snprintf(d.id, sizeof(d.id), "DRONE-%02X%02X%02X", d.mac[3], d.mac[4], d.mac[5]);
+    // Lock-free hex format (NO snprintf here): this is the IRAM_ATTR
+    // promiscuous callback, and printf-family calls take the newlib lock and
+    // abort() in this context. "DRONE-" + last 3 MAC octets.
+    {
+      static const char _hx[] = "0123456789ABCDEF";
+      char* q = d.id;
+      *q++='D'; *q++='R'; *q++='O'; *q++='N'; *q++='E'; *q++='-';
+      for (int k=3; k<6; k++) { *q++=_hx[d.mac[k]>>4]; *q++=_hx[d.mac[k]&0x0F]; }
+      *q = 0;
+    }
     d.lat = d.lon = d.alt = d.speed = 0;
     d.rssi = pkt->rx_ctrl.rssi;
     d.lastSeen = millis();
@@ -9718,20 +9883,33 @@ static int8_t _trackerOUI(const uint8_t* mac) {
 
 // ── Scan for trackers and stingray suspects ──────────────────
 static void _scanThreats() {
+  // Snapshot the network list into a local POD buffer under a BRIEF critical
+  // section, then release the lock before any logging. _mux is a spinlock
+  // shared with the ISR packet callback, so no blocking call (Serial / SD /
+  // printf / SFX / malloc) may run while it is held — doing so aborts(). All
+  // the detection + logging below runs on the copy, outside the lock.
+  static DetectedNetwork cp[MAX_RECON_NETS];
+  size_t cpN;
   NetworkRecon::enterCritical();
-  const auto& nets = NetworkRecon::getNetworks();
+  {
+    const auto& src = NetworkRecon::getNetworks();
+    cpN = src.size(); if (cpN > MAX_RECON_NETS) cpN = MAX_RECON_NETS;
+    for (size_t i = 0; i < cpN; i++) cp[i] = src[i];  // POD copy, no allocation
+  }
+  NetworkRecon::exitCritical();
 
   // Build current RSSI snapshot
   uint8_t snapCount = 0;
   RssiSnapshot snap[8];
-  for (const auto& n : nets) {
+  for (size_t ni = 0; ni < cpN; ni++) {
     if (snapCount >= 8) break;
-    memcpy(snap[snapCount].bssid, n.bssid, 6);
-    snap[snapCount].rssi = n.rssi;
+    memcpy(snap[snapCount].bssid, cp[ni].bssid, 6);
+    snap[snapCount].rssi = cp[ni].rssi;
     snapCount++;
   }
 
-  for (const auto& n : nets) {
+  for (size_t ni = 0; ni < cpN; ni++) {
+    const DetectedNetwork& n = cp[ni];
     // Tracker check via OUI
     int8_t tidx = _trackerOUI(n.bssid);
     if (tidx >= 0) {
@@ -9787,14 +9965,14 @@ static void _scanThreats() {
   // APs happening to share a name. Deliberately NOT flagging same-SSID
   // same-auth-mode pairs, since that's completely normal for mesh WiFi
   // and would be a constant false-positive otherwise.
-  for (size_t i = 0; i < nets.size(); i++) {
-    if (!nets[i].ssid[0]) continue; // skip hidden/blank SSIDs — nothing meaningful to compare
-    for (size_t j = i+1; j < nets.size(); j++) {
-      if (strcmp(nets[i].ssid, nets[j].ssid) != 0) continue;
-      if (memcmp(nets[i].bssid, nets[j].bssid, 6) == 0) continue; // same AP, not a twin
-      if (nets[i].authmode == nets[j].authmode) continue; // consistent security — normal mesh behavior, not suspicious
+  for (size_t i = 0; i < cpN; i++) {
+    if (!cp[i].ssid[0]) continue; // skip hidden/blank SSIDs — nothing meaningful to compare
+    for (size_t j = i+1; j < cpN; j++) {
+      if (strcmp(cp[i].ssid, cp[j].ssid) != 0) continue;
+      if (memcmp(cp[i].bssid, cp[j].bssid, 6) == 0) continue; // same AP, not a twin
+      if (cp[i].authmode == cp[j].authmode) continue; // consistent security — normal mesh behavior, not suspicious
 
-      const DetectedNetwork& suspect = (nets[i].authmode == WIFI_AUTH_OPEN || nets[i].authmode < nets[j].authmode) ? nets[i] : nets[j];
+      const DetectedNetwork& suspect = (cp[i].authmode == WIFI_AUTH_OPEN || cp[i].authmode < cp[j].authmode) ? cp[i] : cp[j];
       bool known = false;
       for (uint8_t k=0; k<_suspectCount; k++)
         if (memcmp(_suspects[k].bssid, suspect.bssid, 6)==0) { known=true; break; }
@@ -9810,14 +9988,12 @@ static void _scanThreats() {
     }
   }
 
-  NetworkRecon::exitCritical();
   memcpy(_prevScan, snap, sizeof(snap));
   _prevCount = snapCount;
 
   // Skimmer check — HC module OUI + SSID pattern on network list
-  NetworkRecon::enterCritical();
-  const auto& nets2 = NetworkRecon::getNetworks();
-  for (const auto& n : nets2) {
+  for (size_t ni = 0; ni < cpN; ni++) {
+    const DetectedNetwork& n = cp[ni];
     // OUI check
     bool ouiHit = false;
     for (uint8_t i=0; i<SKIMMER_OUI_COUNT; i++)
@@ -9853,7 +10029,8 @@ static void _scanThreats() {
   }
 
   // Flipper Zero WiFi devboard — OUI + SSID pattern check
-  for (const auto& n : nets2) {
+  for (size_t ni = 0; ni < cpN; ni++) {
+    const DetectedNetwork& n = cp[ni];
     bool flipperOUI = false;
     for (uint8_t i=0; i<FLIPPER_OUI_COUNT && !flipperOUI; i++)
       if (n.bssid[0]==FLIPPER_OUIS[i][0] && n.bssid[1]==FLIPPER_OUIS[i][1] && n.bssid[2]==FLIPPER_OUIS[i][2])
@@ -9884,9 +10061,9 @@ static void _scanThreats() {
       SFX::play(SFX::DEAUTH);
       Mood::setStatusMessage("FLIPPER DETECTED!");
       WarTales::logDetection("FLIPPER", h.detail);
+      h.logged = true;  // logged here (safe ctx); don't let update() re-log it
     }
   }
-  NetworkRecon::exitCritical();
 }
 
 void start() {
@@ -9925,6 +10102,16 @@ void stop() {
 
 void update() {
   if (!_running) return;
+  // Flush deferred hostile logging here (normal task context): the promiscuous
+  // callback can't safely touch Serial or SD, so it leaves new hostiles with
+  // logged=false and we emit them from here.
+  for (uint8_t i = 0; i < _hostileCount; i++) {
+    if (!_hostiles[i].logged) {
+      Serial.printf("[RADAR] %s: %s rssi=%d\n", _hostiles[i].type, _hostiles[i].detail, _hostiles[i].rssi);
+      WarTales::logDetection(_hostiles[i].type, _hostiles[i].detail);
+      _hostiles[i].logged = true;
+    }
+  }
   static uint32_t _lastScan = 0;
   uint32_t now = millis();
   if (now - _lastScan > 3000) { _scanThreats(); _lastScan = now; }
@@ -10077,7 +10264,7 @@ void enterMode(PorkchopMode m) {
 // ============================================================
 void handleInput() {
   int tx, ty;
-  uint8_t touchEvent = Touch::update(tx, ty);
+  uint8_t touchEvent = touchPoll(tx, ty);   // from the 100Hz touch task
 
   // Web remote control — inject pending gesture from /cmd endpoint
   bool isWebInjected = false;
@@ -10268,19 +10455,18 @@ void handleInput() {
           // Top third = cycle theme
           cfg.themeIndex=(cfg.themeIndex+1)%THEME_COUNT;
         } else if (relY < MAIN_H*2/3) {
-          // Mid third = toggle sound
-          if (cfg.soundEnabled) {
-            cfg.soundEnabled = false;
-          } else {
-            cfg.soundEnabled = true; cfg.soundVolume = 255;
-          }
+          // Mid third = cycle sound volume: OFF -> LOW -> MED -> HIGH -> OFF.
+          if (!cfg.soundEnabled)            { cfg.soundEnabled = true; cfg.soundVolume = 60; }
+          else if (cfg.soundVolume < 90)    { cfg.soundVolume = 120; }
+          else if (cfg.soundVolume < 170)   { cfg.soundVolume = 220; }
+          else                              { cfg.soundEnabled = false; }
           char vmsg[24];
           if (cfg.soundEnabled)
             snprintf(vmsg,sizeof(vmsg),"VOL: %d%%",(cfg.soundVolume*100)/255);
           else
             strncpy(vmsg,"SOUND OFF",sizeof(vmsg));
           Display::showToast(vmsg, 1500);
-          if (cfg.soundEnabled) SFX::play(SFX::CLICK);
+          if (cfg.soundEnabled) SFX::play(SFX::CLICK);  // click at the new level so you hear it
         } else {
           // Bottom third = toggle ghost mode
           cfg.ghostMode = !cfg.ghostMode;
@@ -10577,7 +10763,8 @@ void loadConfig() {
 void rotateScreen() {
   cfg.screenRotation = (cfg.screenRotation == 3) ? 1 : 3;
   tft.setRotation(cfg.screenRotation);
-  touch.setRotation(cfg.screenRotation);
+  // FT6336 has no setRotation — Touch::getPoint() reads cfg.screenRotation
+  // directly and applies the matching transform.
   prefs.begin("pork", false);
   prefs.putUChar("rotation", cfg.screenRotation);
   prefs.end();
@@ -10705,12 +10892,22 @@ static void dumpWiGLECSV(float lat, float lon) {
   Serial.println("# === WIGLE CSV FORMAT ===");
   Serial.println("# Upload to wigle.net or import to WiGLE app");
   Serial.println();
-  Serial.println("WigleWifi-1.4,appRelease=PorkChopCYD,model=ESP32-CYD,release=1.0,device=PorkChopCYD,display=yes,board=esp32,brand=Espressif");
+  Serial.println("WigleWifi-1.4,appRelease=PorkChopC5,model=ESP32-C5,release=1.0,device=PorkChopC5,display=yes,board=esp32c5,brand=Espressif");
   Serial.println("MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMSL,Accuracy,Type");
 
+  // Snapshot the list under the lock, then stream CSV OUTSIDE it
+  // (Serial.print takes a lock and aborts inside the _mux spinlock).
+  static DetectedNetwork cp[MAX_RECON_NETS];
+  size_t cpN;
   NetworkRecon::enterCritical();
-  const auto& nets = NetworkRecon::getNetworks();
-  for (const auto& n : nets) {
+  {
+    const auto& src = NetworkRecon::getNetworks();
+    cpN = src.size(); if (cpN > MAX_RECON_NETS) cpN = MAX_RECON_NETS;
+    for (size_t i=0;i<cpN;i++) cp[i]=src[i];
+  }
+  NetworkRecon::exitCritical();
+  for (size_t ni=0; ni<cpN; ni++) {
+    const DetectedNetwork& n = cp[ni];
     // MAC
     _mac(n.bssid);
     Serial.print(',');
@@ -10748,7 +10945,6 @@ static void dumpWiGLECSV(float lat, float lon) {
     }
     Serial.println(",0,0,WIFI");
   }
-  NetworkRecon::exitCritical();
   Serial.println();
 }
 
@@ -10756,7 +10952,7 @@ static void dumpWiGLECSV(float lat, float lon) {
 static void dumpHeader() {
   Serial.println();
   Serial.println("========================================");
-  Serial.println("  PORKCHOP CYD — CAPTURE DUMP");
+  Serial.println("  PORKCHOP C5 — CAPTURE DUMP");
   Serial.printf ("  Heap: %u free / %u largest\n",
     ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   Serial.printf ("  Networks seen: %d\n", NetworkRecon::getNetworkCount());
@@ -10994,13 +11190,23 @@ void saveWigleCSV() {
   File f = SD.open(fname, FILE_WRITE);
   if (!f) { Serial.println("[SD] WiGLE CSV open failed"); return; }
   // WiGLE CSV header
-  f.println("WigleWifi-1.4,appRelease=PorkChopCYD,model=ESP32,release=1.0,device=CYD,display=Yes,board=ESP32,brand=Espressif");
+  f.println("WigleWifi-1.4,appRelease=PorkChopC5,model=ESP32-C5,release=1.0,device=C5,display=Yes,board=ESP32C5,brand=Espressif");
   f.println("MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type");
   // Write all networks from NetworkRecon
+  // Snapshot under the lock, then write SD CSV OUTSIDE it (f.printf / SD file
+  // I/O takes locks and aborts inside the _mux spinlock).
+  static DetectedNetwork cp[MAX_RECON_NETS];
+  size_t cpN;
   NetworkRecon::enterCritical();
-  const auto& nets = NetworkRecon::getNetworks();
+  {
+    const auto& src = NetworkRecon::getNetworks();
+    cpN = src.size(); if (cpN > MAX_RECON_NETS) cpN = MAX_RECON_NETS;
+    for (size_t i=0;i<cpN;i++) cp[i]=src[i];
+  }
+  NetworkRecon::exitCritical();
   uint32_t count = 0;
-  for (const auto& n : nets) {
+  for (size_t ni=0; ni<cpN; ni++) {
+    const DetectedNetwork& n = cp[ni];
     char auth[16] = "[ESS]";
     if      (n.authmode == WIFI_AUTH_WPA3_PSK)           strncpy(auth, "[WPA3-SAE-CCMP][ESS]", sizeof(auth)-1);
     else if (n.authmode == WIFI_AUTH_WPA2_WPA3_PSK)      strncpy(auth, "[WPA2-PSK-CCMP][WPA3-SAE-CCMP][ESS]", sizeof(auth)-1);
@@ -11022,7 +11228,6 @@ void saveWigleCSV() {
              csvLat, csvLon, csvAlt, csvAcc);
     count++;
   }
-  NetworkRecon::exitCritical();
   f.close();
   Serial.printf("[SD] WiGLE CSV: %s (%lu nets)\n", fname, count);
 }
@@ -12563,26 +12768,9 @@ void setup() {
   // USB debug console first so the boot banner is visible while flashing/testing.
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n=== PORKCHOP CYD v6 STARTING (NM-RF-HAT GPS build) ===");
+  Serial.println("\n=== PORKCHOP C5 v6 STARTING (Waveshare ESP32-C5-Touch-LCD-3.5) ===");
   Serial.printf("[HEAP] startup: free=%u largest=%u\n", ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
-#if GPS_ENABLED
-  // --- NM-RF-HAT GPS pin arbitration ---
-  // GPIO 1 is also UART0's TX pin (U0TXD), which is wired to the USB-serial
-  // chip. We don't want to rip UART0 off the pin entirely (that destabilized
-  // boot) — we just need GPIO 1 free to be reassigned as Serial2's RX input.
-  // Setting it to plain INPUT (no pulls) is enough: it stops UART0 driving it
-  // as an output, and Serial2.begin() then claims it via the GPIO matrix.
-  // USB debug TEXT OUTPUT still stops here once Serial2 takes the pin (the
-  // banner above is the last thing you'll see) — that part of the original
-  // note was correct. Serial command INPUT still works for WIGLE/WPASEC entry.
-  //
-  // Prefer full USB serial debug over the hat's GPS routing? Wire the GPS to
-  // GPIO 3 instead, set GPS_RX_PIN = 3 above, and remove the pinMode line below.
-  Serial.flush();
-  pinMode(GPS_RX_PIN, INPUT);
-  Serial2.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, -1);   // GPS NMEA in on GPIO 1
-#endif
 
   // SD CS high (prevent SPI bus issues)
   pinMode(SD_CS_PIN,OUTPUT); digitalWrite(SD_CS_PIN,HIGH);
@@ -12592,34 +12780,36 @@ void setup() {
   pinMode(LED_G_PIN,OUTPUT); digitalWrite(LED_G_PIN,HIGH);
   pinMode(LED_B_PIN,OUTPUT); digitalWrite(LED_B_PIN,HIGH);
 
-  // Backlight on
-  pinMode(TFT_BL_PIN,OUTPUT); digitalWrite(TFT_BL_PIN,HIGH);
+  // I/O expander (0x24) FIRST: opens the I2C bus, powers the panel rail, and
+  // pulses the LCD + touch resets. Backlight is switched on here too — there
+  // is no backlight GPIO on this board. MUST run before tft.begin().
+  ws_c5_exio_begin();
 
   // TFT
-  tft.begin(); tft.setRotation(3); tft.fillScreen(TFT_BLACK);  // rotation 3 = 180deg flip from stock port (NM-RF-HAT mounting)
+  tft.begin(); tft.setRotation(3); tft.fillScreen(TFT_BLACK);  // rotation 3 = default landscape for the C5 build
 
-  // SD init — use dedicated sdSPI instance on pins 18/19/23
-  // Must be initialized BEFORE touchSPI.begin() which reconfigures the shared VSPI peripheral
+  // SD init — share the ST7796's own SPI bus instance (tft.getSPIinstance()).
+  // The bus is already up from tft.begin(); SD just adds CS 9. Do NOT begin a
+  // separate SPIClass here and NEVER call .end() on this bus — ending it blanks
+  // the live display (that was the dark-screen bug). SD uses per-transaction
+  // settings, so it coexists with TFT draws on the shared bus.
   Serial.printf("[SD] Pre-init heap: %u largest: %u\n", ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   pinMode(SD_CS_PIN, OUTPUT); digitalWrite(SD_CS_PIN, HIGH);
   delay(10);
-  sdSPI.begin(18, 19, 23, SD_CS_PIN);  // CLK, MISO, MOSI, CS
   for (int attempt = 0; attempt < 3 && !sdAvailable; attempt++) {
     Serial.printf("[SD]   attempt %d @ 400kHz...\n", attempt+1);
-    if (SD.begin(SD_CS_PIN, sdSPI, 400000)) {
+    if (SD.begin(SD_CS_PIN, tft.getSPIinstance(), 400000)) {
       sdAvailable = true;
       uint8_t ct = SD.cardType();
-      Serial.printf("[SD] OK on CS=5 type=%s %lluMB\n",
+      Serial.printf("[SD] OK on CS=9 type=%s %lluMB\n",
         ct==CARD_MMC?"MMC":ct==CARD_SD?"SD":ct==CARD_SDHC?"SDHC":"UNKNOWN",
         SD.totalBytes() / (1024*1024));
     } else {
       Serial.printf("[SD]   failed\n");
-      SD.end();
       delay(100);
     }
   }
   if (!sdAvailable) {
-    sdSPI.end();
     Serial.println("[SD] Not found — check: FAT32 format, card seated");
   } else {
     // Pre-create all required directories
@@ -12645,8 +12835,44 @@ void setup() {
   Display::init();
   tft.fillScreen(colorBG());
   Display::showBootSplash();
-  touchSPI.begin(TOUCH_CLK_PIN,TOUCH_MISO_PIN,TOUCH_MOSI_PIN,TOUCH_CS_PIN);
-  touch.begin(touchSPI); touch.setRotation(cfg.screenRotation);  // match display rotation so touch zones aren't mirrored
+  // FT6336 capacitive touch over I2C. ft6336_init() re-runs the expander
+  // bring-up (safe) and configures the controller. Rotation is applied per
+  // read in Touch::getPoint() from cfg.screenRotation — no setRotation call.
+  ft6336_init();
+
+  // Shared-bus lock (touch task + GPS task), then the LC76G over I2C. The J3
+  // UART hole doesn't reach the chip on this board, so the GPS uses SDA/SCL.
+  i2c_lock_init();
+#if GPS_ENABLED
+  // If a reset landed mid-transaction the module ignores 0x50 until released
+  // (demo's Recovery_I2C: dummy write to 0x54, then 0x58) — do that first.
+  bool _gpsSeen = (_lc76g_dummy(LC76G_CR_ADDR) == 0);
+  if (!_gpsSeen && (_lc76g_dummy(LC76G_RD_ADDR) == 0 || _lc76g_dummy(0x58) == 0)) {
+    delay(10);
+    _gpsSeen = (_lc76g_dummy(LC76G_CR_ADDR) == 0);
+  }
+  Serial.printf("[GPS] LC76G over I2C on SDA %d / SCL %d: %s\n", CTP_SDA, CTP_SCL,
+                _gpsSeen ? "found at 0x50" : "NOT found at 0x50 (check SDA/SCL wires)");
+  gps_i2c_begin();
+#endif
+
+  // ── Audio bring-up (Step A): start I2S master (clocks the ES8311 off SCLK),
+  //    init the codec over I2C, then play a boot test tone. ──────────────────
+  audioI2S.setPins(AUD_BCLK, AUD_LRCK, AUD_DOUT, -1, -1);  // bclk, ws, dout, din, mclk(none)
+  if (audioI2S.begin(I2S_MODE_STD, AUD_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO)) {
+    Serial.println("[I2S] master started (BCLK 23 / LRCK 10 / DOUT 25)");
+    bool codecOk = es8311_init_dac();
+    audioReady = true;
+    Serial.printf("[AUDIO] ES8311 %s — starting audio task\n", codecOk ? "ID OK" : "no/!ID");
+    // Audio render task on core 0, small stack (just a PCM loop).
+    xTaskCreatePinnedToCore(audioTask, "audio", 3072, nullptr, 5, nullptr, 0);
+  } else {
+    Serial.println("[I2S] begin FAILED");
+  }
+
+  // Touch polling task — fixed 100Hz, independent of render rate (fixes the
+  // stiff feel after the full-screen Phase-2 sprite slowed the loop).
+  xTaskCreatePinnedToCore(touchTask, "touch", 3072, nullptr, 4, nullptr, 0);
 
   // Init subsystems
   SFX::init();
@@ -12659,10 +12885,6 @@ void setup() {
 
   // Load persisted captures from SPIFFS
   SpiffsSave::loadAll();
-
-#if GPS_ENABLED
-  Serial.printf("[GPS] NM-RF-HAT GNSS on RX=%d baud=%d\n", GPS_RX_PIN, GPS_BAUD);
-#endif
 
   bootTime=millis();
 
@@ -12685,7 +12907,7 @@ void setup() {
 
   Serial.printf("[BOOT] Free heap: %u largest: %u\n",
                 ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-  Serial.println("=== PORKCHOP CYD v6 READY ===");
+  Serial.println("=== PORKCHOP C5 v6 READY ===");
   // Apply ghost mode if it was saved on
   if (cfg.ghostMode) {
     GhostMode::apply();
@@ -12707,17 +12929,23 @@ void loop() {
   QuickCrack::update(); // no-op unless a run is actively in progress
 
 #if GPS_ENABLED
-  // Drain at most a bounded number of GPS bytes per loop pass. An unbounded
-  // `while(Serial2.available())` can churn through a large backlog (which builds
-  // up while a WiFi scan starves the loop), hogging the CPU long enough to trip
-  // the task watchdog and reset the board — that was the WARHOG crash. Capping
-  // it keeps each pass short; any leftover bytes are picked up next pass.
-  for (int _g = 0; _g < 64 && Serial2.available(); _g++) gps.encode(Serial2.read());
+  // Feed NMEA from the GPS I2C task (gps_i2c.h) into TinyGPS++. The stream
+  // holds at most 8 KB, so one drain per pass is bounded (no watchdog risk).
+  if (g_gpsStream) {
+    uint8_t _gb[256]; size_t _gn;
+    while ((_gn = xStreamBufferReceive(g_gpsStream, _gb, sizeof(_gb), 0)) > 0)
+      for (size_t _i = 0; _i < _gn; _i++) gps.encode(_gb[_i]);
+  }
   if(gps.location.isValid()){
     gpsHasFix=true; gpsLat=gps.location.lat(); gpsLon=gps.location.lng();
     gpsSpeedKmh=gps.speed.kmph(); gpsSats=gps.satellites.value();
     if(gps.altitude.isValid()) gpsAlt=gps.altitude.meters();
   } else { gpsHasFix=false; gpsSats=gps.satellites.value(); }
+  // One-time console milestones so the GPS link can be checked without a screen.
+  { static bool _gpsRx = false, _gpsFix = false;
+    if (!_gpsRx && gps.charsProcessed() > 0) { _gpsRx = true; Serial.println("[GPS] receiving NMEA"); }
+    if (!_gpsFix && gpsHasFix) { _gpsFix = true; Serial.printf("[GPS] fix: %d sats\n", (int)gpsSats); }
+  }
 #endif
 
   // ── Serial phrase entry for UNLOCKABLES (no physical keyboard on CYD) ──
