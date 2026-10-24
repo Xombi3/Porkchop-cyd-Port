@@ -14,6 +14,16 @@
 #define FT6336_ADDR      0x38
 #define FT6336_TD_STATUS 0x02
 #define FT6336_T1_XH     0x03
+#define FT6336_G_MODE    0xA4   // interrupt mode: 0 = polling (INT = level, low while touched)
+
+// FT6336 INT (TP_INT) on GPIO3, with an external 10K pull-up (Waveshare
+// schematic) — so it idles HIGH and goes LOW while a finger is down. Used to
+// gate the touch read: on a bare panel a blind poll returns stale/phantom
+// points (a menu row self-selects at boot, taps land a row off), so skip the
+// I2C read unless INT says a finger is actually down.
+#ifndef CTP_INT
+#define CTP_INT 3
+#endif
 
 static bool _ft6336_read(uint8_t reg, uint8_t *buf, uint8_t len) {
   Wire.beginTransmission(FT6336_ADDR);
@@ -53,6 +63,16 @@ static void ft6336_init() {
   Wire.write(0x80);
   Wire.write(12);
   Wire.endTransmission();
+
+  // INT-gate setup: INT (GPIO3) is externally pulled up, so no internal pull.
+  // Put the FT6336 in interrupt-polling mode (G_MODE = 0) so INT is a stable
+  // LEVEL (low = finger down) for as long as the touch is held — this is what
+  // lets getPoint() gate on digitalRead() and skip the blind I2C read.
+  pinMode(CTP_INT, INPUT);
+  Wire.beginTransmission(FT6336_ADDR);
+  Wire.write(FT6336_G_MODE);
+  Wire.write((uint8_t)0);
+  Wire.endTransmission();
 }
 
 // Reads raw panel coordinates (panel native portrait space: 0..319 x 0..479).
@@ -77,6 +97,10 @@ static uint8_t _ft6336_read_raw_nolock(uint16_t *raw_x, uint16_t *raw_y) {
 
 // Bus-locked wrapper: the GPS task shares this bus (see i2c_lock.h).
 static uint8_t ft6336_read_raw(uint16_t *raw_x, uint16_t *raw_y) {
+  // INT gate: no finger (INT high) -> no touch, and skip the I2C read entirely
+  // so a blind poll can't return a phantom point. This is a plain GPIO read, so
+  // do it before taking the bus mutex — avoids contending with the GPS task.
+  if (digitalRead(CTP_INT) != LOW) return 0;
   i2c_lock();
   uint8_t r = _ft6336_read_raw_nolock(raw_x, raw_y);
   i2c_unlock();
