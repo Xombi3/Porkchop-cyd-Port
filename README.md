@@ -168,7 +168,7 @@ buymeacoffee.com/xombi3
     | PORK PATROL                 | NEW — Flock ALPR + Axon bodycam detect  |
     | Keyboard text entry         | NOT PORTED — no keyboard on CYD         |
     |                             | (API keys set in source before flash)   |
-    | PIGGY BLUES                 | STUB — BLE stack exceeds RAM budget     |
+    | PIGGY BLUES                 | PORTED — WarDriveGo BLE bridge          |
     | Charging screen             | NOT PORTED — CYD has no battery IC     |
     | Crash viewer                | NOT PORTED — low value on CYD          |
     | SD format tool              | NOT PORTED — format card before use    |
@@ -411,14 +411,16 @@ buymeacoffee.com/xombi3
 
 ----[ 8.7 - PIGGY BLUES
 
-    BLE advertisement spam — stubbed on CYD.
+    WarDriveGo bridge over BLE using the GhostLink GATT protocol.
 
-    The BLE stack requires ~60KB contiguous RAM which cannot coexist
-    with the display sprite and WiFi stack on the CYD's 320KB heap.
-    Mode displays a message explaining the constraint.
+    The ESP32-C5 reserves BLE before display, GPS, and audio startup, then
+    advertises after setup completes. WiFi recon remains active behind the
+    normal PorkChop UI and feeds a 256-record PSRAM catalog. Selecting this
+    mode opens the live APS / TX / DROP / RETRY dashboard; leaving the screen
+    does not stop the bridge.
 
-    Hardware limitation. Cannot be resolved without reducing other
-    features.
+    Enabled by default on this C5 port. Define PIGGYBLUES_DISABLE to compile
+    the legacy no-BLE stub.
 
 
 ----[ 8.8 - PORK PATROL
@@ -782,11 +784,11 @@ buymeacoffee.com/xombi3
         WiFi driver deadlock → volatile callback pointer, no mutex
         Stack canary in WebUI → increased task stack
         SD directory creation → parent dirs created automatically
-        NimBLE/sprite memory conflict → BLE stubbed, sprite preserved
+        NimBLE/sprite memory conflict → early BLE reservation + PSRAM catalog
 
     Known limitations:
-        PIGGY BLUES unavailable — BLE stack (~60KB) + sprite (102KB)
-          + WiFi + SD exceeds 320KB heap. Hardware constraint.
+        WarDriveGo applies its own run, GPS, geofence, and BSSID dedup rules,
+          so its AP total can be lower than PorkChop's catalog count.
         Web Remote screen mirror occasionally stalls (Chrome issue)
         GPS NMEA causes brief garbage at boot (GPIO 3 shared)
         SPIFFS mount error at boot is cosmetic (formats on first use)
