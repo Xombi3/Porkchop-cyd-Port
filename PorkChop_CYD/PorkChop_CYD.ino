@@ -51,7 +51,10 @@
 // Extra includes for full port
 #include <vector>
 #include <atomic>
-// PIGGY BLUES uses stub on CYD — BLE stack incompatible with sprite memory budget
+// PIGGY BLUES — WarDriveGo (GhostLink) BLE bridge. On the CYD this was a stub
+// (BLE stack vs sprite memory budget). On the C5 the sprite lives in PSRAM and
+// NimBLE is available, so the bridge runs behind the normal UI by default.
+#include "piggyblues_bridge.h"
 
 // GPS — ENABLED. Waveshare LC76G Multi-GNSS over I2C on the J3 header's SDA/SCL
 // (shared with touch/codec/expander): GPS SDA -> J3 SDA, GPS SCL -> J3 SCL,
@@ -388,7 +391,8 @@ static const float SINC_LUT[45] = {
 };
 static int8_t  specBuf[SPEC_W];
 static int8_t  specPeak[SPEC_W];
-static uint8_t wfallBuf[WFALL_ROWS][SPEC_W];
+using WaterfallRow = uint8_t[SPEC_W];
+static WaterfallRow* wfallBuf = nullptr;
 static uint8_t wfallRow = 0;
 static uint32_t wfallLastMs = 0;
 static uint32_t specEnterMs = 0;  // When we entered SPECTRUM_MODE (for N13TZSCH3 ach)
@@ -3914,7 +3918,7 @@ void update() {
         {"OINK MODE",    "deauth + sniff eapol"},
         {"DO NO HAM",    "passive recon, zero tx"},
         {"SGT WARHOG",   "wardriving + gps log"},
-        {"PIGGY BLUES",  "ble notification spam"},
+        {"PIGGY BLUES",  "WarDriveGo BLE bridge"},
         {"BACON MODE",   "fake beacon injection"},
         {"PORK PATROL",  "sniff out flock cams"},
         {"SNOUT",        "evil twin+deauth+probe"},
@@ -4096,9 +4100,22 @@ void update() {
 
         } else if (currentMode == PorkchopMode::PIGGYBLUES_MODE) {
           dst.setTextColor(colorFG(), colorBG());
-          char buf[32];
-          snprintf(buf, sizeof(buf), "BLE TX: %lu", PiggyBlues::getPackets());
-          dst.drawString(buf, 2, yOff+MAIN_H-12);
+          dst.setTextFont(1);
+          dst.setTextSize(2);
+          dst.setTextDatum(TR_DATUM);
+          const pbble::Stats bs = pbble::stats();
+          const int sx = DISPLAY_W - 8;
+          char buf[40];
+          dst.drawString("WARDRIVEGO", sx, yOff+166);
+          dst.drawString(bs.streaming ? "STREAMING" : bs.connected ? "LINKED" : "WAITING", sx, yOff+192);
+          snprintf(buf, sizeof(buf), "APS: %lu  TX: %lu", (unsigned long)bs.captured,
+                   (unsigned long)bs.sent);
+          dst.drawString(buf, sx, yOff+218);
+          snprintf(buf, sizeof(buf), "DROP: %lu  RETRY: %lu", (unsigned long)bs.disconnects,
+                   (unsigned long)bs.txRetries);
+          dst.drawString(buf, sx, yOff+244);
+          dst.setTextSize(1);
+          dst.setTextDatum(TL_DATUM);
         }
       };
 
@@ -4128,6 +4145,11 @@ void update() {
 
     // ── SPECTRUM ─────────────────────────────────────────────────────────────
     case PorkchopMode::SPECTRUM_MODE: {
+      if (!wfallBuf) {
+        wfallBuf = static_cast<WaterfallRow*>(heap_caps_calloc_prefer(
+            WFALL_ROWS, sizeof(WaterfallRow), 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT));
+        if (!wfallBuf) { Display::showToast("SPECTRUM: LOW MEMORY", 1000); break; }
+      }
       // ── Update spectrum buffers from network data ─────────────────────────
       // Noise floor
       for (int x=0;x<SPEC_W;x++)
@@ -6158,7 +6180,20 @@ static void _processPending() {
     _pendR = (_pendR+1)%PENDING_NET_SLOTS;
     taskENTER_CRITICAL(&_mux);
     bool exists = (_findNetByBssid(p.bssid)>=0);
-    if (!exists && (int)_nets.size()<MAX_RECON_NETS) _nets.push_back(p);
+    if (!exists) {
+      if ((int)_nets.size() < MAX_RECON_NETS) {
+        _nets.push_back(p);
+      } else {
+        // Keep the UI table bounded in internal RAM, but rotate its oldest
+        // non-target entry so a moving survey continues discovering new APs.
+        // PiggyBlues harvests each replacement into its larger PSRAM catalog.
+        int oldest = -1;
+        for (int i=0; i<(int)_nets.size(); ++i)
+          if (!_nets[i].isTarget && (oldest < 0 || _nets[i].lastSeen < _nets[oldest].lastSeen)) oldest = i;
+        if (oldest >= 0) _nets[oldest] = p;
+        else exists = true; // every slot is pinned by an active target
+      }
+    }
     taskEXIT_CRITICAL(&_mux);
     if (!exists && _newNetCb)
       _newNetCb(p.authmode, p.isHidden, p.ssid, p.rssi, p.channel);
@@ -8825,13 +8860,130 @@ float getPeakSpeedKmh()   { return _peakSpeedKmh; }
 // ============================================================
 // ── PIGGY BLUES — stubbed out on CYD (BLE stack conflicts with sprite memory)
 namespace PiggyBlues {
-  static uint32_t _totalPkts = 0;
-  static bool _running = false;
+#if defined(PIGGYBLUES_BLE)
+#if defined(PB_BRIDGE_NORMAL_MODE)
+  static constexpr uint16_t NORMAL_CATALOG_CAPACITY = 256;
+  static pbwire::Ap* normalCatalog = nullptr;
+  static uint16_t normalCatalogCount = 0;
+  static uint32_t normalCatalogGeneration = 0;
+  static uint32_t normalCatalogDropped = 0;
+
+  static bool initNormalCatalog() {
+    if (normalCatalog) return true;
+    normalCatalog = static_cast<pbwire::Ap*>(heap_caps_calloc(
+        NORMAL_CATALOG_CAPACITY, sizeof(pbwire::Ap), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!normalCatalog) Serial.println("[blues] normal PSRAM catalog allocation failed");
+    return normalCatalog != nullptr;
+  }
+
+  static void harvestNormalCatalog(uint32_t now) {
+    static uint32_t lastHarvest = 0;
+    if (!normalCatalog || now - lastHarvest < 250) return;
+    lastHarvest = now;
+    const auto& nets = NetworkRecon::getNetworks();
+    for (const auto& n : nets) {
+      int slot = -1;
+      for (uint16_t i=0; i<normalCatalogCount; ++i) {
+        if (memcmp(normalCatalog[i].mac, n.bssid, 6) == 0) { slot = i; break; }
+      }
+      if (slot < 0) {
+        if (normalCatalogCount < NORMAL_CATALOG_CAPACITY) {
+          slot = normalCatalogCount++;
+        } else {
+          slot = 0;
+          for (uint16_t i=1; i<normalCatalogCount; ++i)
+            if (normalCatalog[i].at < normalCatalog[slot].at) slot = i;
+          ++normalCatalogDropped;
+        }
+      }
+      auto& ap = normalCatalog[slot];
+      memcpy(ap.mac, n.bssid, 6);
+      strncpy(ap.ssid, n.ssid, sizeof(ap.ssid) - 1); ap.ssid[sizeof(ap.ssid) - 1] = 0;
+      ap.rssi = n.rssiAvg ? n.rssiAvg : n.rssi;
+      ap.channel = n.channel;
+      ap.authmode = n.authmode;
+      ap.hidden = n.isHidden;
+      ap.at = n.lastSeen;
+    }
+    ++normalCatalogGeneration;
+    pbble::setScanMetrics(normalCatalogGeneration, normalCatalogCount, normalCatalogDropped);
+  }
+#endif
+
+  // AP source for the bridge: hand it porkchop's already-scanned, dedup'd
+  // networks. The bridge owns the cursor; we skip records older than the
+  // freshness window and signal end-of-table with -1.
+  static int apProvider(uint32_t& cursor, pbwire::Ap& ap, uint32_t now) {
+#if defined(PB_BRIDGE_NORMAL_MODE)
+    while (cursor < normalCatalogCount) {
+      const pbwire::Ap& n = normalCatalog[cursor++];
+      if (now - n.at > pbwire::AP_FRESH_MS) continue;
+      ap = n;
+      return 1;
+    }
+    return -1;
+#else
+    std::vector<DetectedNetwork>& nets = NetworkRecon::getNetworks();
+    while (cursor < nets.size()) {
+      const DetectedNetwork& n = nets[cursor++];
+      if (now - n.lastSeen > pbwire::AP_FRESH_MS) continue; // stale: skip
+      memcpy(ap.mac, n.bssid, 6);
+      strncpy(ap.ssid, n.ssid, sizeof(ap.ssid) - 1); ap.ssid[sizeof(ap.ssid) - 1] = 0;
+      ap.rssi     = n.rssiAvg ? n.rssiAvg : n.rssi;
+      ap.channel  = n.channel;
+      ap.authmode = n.authmode;
+      ap.hidden   = n.isHidden;
+      ap.at       = n.lastSeen;
+      return 1;
+    }
+    return -1; // cursor past end of table
+#endif
+  }
+  void start() {
+#if defined(PB_BRIDGE_NORMAL_MODE)
+    Display::showToast(pbble::enabled() ? "BLUES: BACKGROUND ON" : "BLUES: UNAVAILABLE", 1500);
+#else
+    // Enter through a one-shot reboot so BLE and Wi-Fi get a clean, predictable
+    // allocation order. The dedicated bridge path draws the pig directly and
+    // skips the normal UI, SD, GPS and audio subsystems.
+    Preferences cp; cp.begin("bluesx", false); cp.putBool("cold", true); cp.end();
+    Display::showToast("BLUES: REBOOT -> BLE", 1500);
+    Serial.println("[blues] cold-boot flag set; restarting into BLE-only");
+    delay(400);
+    esp_restart();
+#endif
+  }
+  void stop() {
+#if defined(PB_BRIDGE_NORMAL_MODE)
+    // The background bridge intentionally survives visible-mode changes.
+#else
+    pbble::setEnabled(false);                      // deinits BLE, returns internal RAM
+    pbble::heapProbe("post-ble-deinit");
+    delay(10);
+    WiFi.mode(WIFI_STA);                           // restore WiFi for other modes
+    pbble::heapProbe("post-exit-restore");
+    Serial.println("[blues] wifi restored");
+#endif
+  }
+  void update() {
+#if defined(PB_BRIDGE_NORMAL_MODE)
+    // The normal mode dispatcher does not run its default recon branch while
+    // this dashboard is visible. Keep beacon parsing/channel hopping alive so
+    // the background catalog does not age out after AP_FRESH_MS.
+    NetworkRecon::update();
+#else
+    pbble::tick(millis());
+#endif
+  }
+  bool isRunning()     { return pbble::enabled(); }
+  uint32_t getPackets(){ return pbble::stats().sent; }
+#else
   void start()  { Display::showToast("BLUES: N/A ON C5",2000); }
-  void stop()   { _running = false; }
+  void stop()   {}
   void update() {}
   bool isRunning()     { return false; }
   uint32_t getPackets(){ return 0; }
+#endif
 } // namespace PiggyBlues
 
 
@@ -10168,6 +10320,12 @@ void getSuspectInfo(uint8_t i, uint8_t* bssid, char* reason, int8_t* rssi) {
 
 
 void startScan() {
+#if defined(PIGGYBLUES_BLE) && defined(PB_BRIDGE_NORMAL_MODE)
+  // NetworkRecon already supplies the bridge from its continuously updated
+  // promiscuous table. A simultaneous esp_wifi active scan temporarily drains
+  // the small internal DMA pool and can starve BLE connection events.
+  if (pbble::enabled()) return;
+#endif
   // Only do a passive scan when no active mode is running promiscuous
   if (currentMode==PorkchopMode::OINK_MODE   ||
       currentMode==PorkchopMode::DNH_MODE    ||
@@ -12005,7 +12163,7 @@ static char    _rbuf[512];  // request buffer — BSS
 static char    _chunk[64];  // HTML send chunk — BSS
 static char    _cmdArg[32]; // command arg — BSS
 static char    _resp[400];  // response — BSS (holds /status's larger payload too)
-static uint8_t _frameBuf[160*80*2]; // full screen frame, built up front then streamed
+static uint8_t* _frameBuf = nullptr; // full screen frame, built up front then streamed
 
 // ── Non-blocking chunked response sender ────────────────────────────────────
 // Both /screen and /download can be large enough that sending them in one
@@ -12198,6 +12356,18 @@ static void _serveClient(int cfd) {
       const uint16_t sprH=(uint16_t)mainSprite.height();
       const uint16_t outW=160, outH=(sprH>=200)?100:(sprH/2>0?sprH/2:80);
       uint32_t bodyLen=(uint32_t)outW*outH*2;
+      if (!_frameBuf) {
+        // Tall sprites produce 100 rows. The encoded frame must also survive
+        // subsequent loop iterations while the socket drains.
+        _frameBuf = static_cast<uint8_t*>(heap_caps_malloc_prefer(
+            160 * 100 * 2, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT));
+        if (!_frameBuf) {
+          const char busy[] = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+          send(cfd, busy, sizeof(busy) - 1, 0);
+          close(cfd);
+          return;
+        }
+      }
       char hdr[200];
       snprintf(hdr,sizeof(hdr),
         "HTTP/1.1 200 OK\r\n"
@@ -12758,6 +12928,136 @@ bool isBusy() { return _busy; }
 // ============================================================
 // SETUP
 // ============================================================
+#if defined(PIGGYBLUES_BLE)
+// Dedicated bridge boot: initialize only the panel, Wi-Fi scanner and native
+// NimBLE service. The normal UI, SD, GPS and audio allocations are skipped.
+// The one-shot NVS gate is cleared before entry, so a reset returns to the UI.
+// Only the main loop accesses these tables. Swap completed snapshots at a
+// round boundary so a receiver cannot get half of two different surveys.
+static constexpr unsigned BRIDGE_SCAN_CAPACITY = 256;
+static pbwire::Ap* bridgeScan = nullptr;
+static unsigned activeScan = 0;
+static int bridgeCount[2] = {};
+static bool snapshotReady = false;
+static bool initBridgeScanBuffers() {
+  bridgeScan = static_cast<pbwire::Ap*>(heap_caps_calloc(
+      2 * BRIDGE_SCAN_CAPACITY, sizeof(pbwire::Ap), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!bridgeScan) Serial.println("[blues] PSRAM scan-buffer allocation failed");
+  return bridgeScan != nullptr;
+}
+static pbwire::Ap* bridgeBuffer(unsigned index) {
+  return bridgeScan + index * BRIDGE_SCAN_CAPACITY;
+}
+static int coldRealProvider(uint32_t& cursor, pbwire::Ap& ap, uint32_t) {
+  if (cursor == 0) {
+    if (!snapshotReady) return 0;
+    activeScan ^= 1;
+    snapshotReady = false;
+  }
+  if (cursor >= (unsigned)bridgeCount[activeScan]) return -1;
+  ap = bridgeBuffer(activeScan)[cursor++];
+  return 1;
+}
+
+static bool bridgeScanPaused = false;
+static void pollBridgeScan(uint32_t now) {
+  static uint32_t lastStart = 0;
+  static bool scanning = false;
+  static uint32_t generation = 0;
+  if (!scanning) {
+    if (bridgeScanPaused) return;
+    if (lastStart && now - lastStart < 15000) return;
+    lastStart = now;
+    scanning = WiFi.scanNetworks(true) == WIFI_SCAN_RUNNING;
+    return;
+  }
+  const int n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) return;
+  scanning = false;
+  if (n < 0) { Serial.printf("[blues] scan error %d\n", n); return; }
+  const unsigned staging = activeScan ^ 1;
+  int count = 0;
+  int dropped = 0;
+  for (int i = 0; i < n; ++i) {
+    const uint8_t* mac = WiFi.BSSID(i);
+    if (!mac || count >= (int)BRIDGE_SCAN_CAPACITY) { ++dropped; continue; }
+    auto& ap = bridgeBuffer(staging)[count++];
+    ap = {};
+    memcpy(ap.mac, mac, 6);
+    WiFi.SSID(i).toCharArray(ap.ssid, sizeof(ap.ssid));
+    ap.rssi = WiFi.RSSI(i);
+    ap.channel = WiFi.channel(i);
+    ap.authmode = WiFi.encryptionType(i);
+    ap.hidden = !ap.ssid[0];
+    ap.at = now;
+  }
+  bridgeCount[staging] = count;
+  WiFi.scanDelete();
+  snapshotReady = true;
+  ++generation;
+  pbble::setScanMetrics(generation, count, dropped);
+  Serial.printf("[blues] scan %lu captured=%d dropped=%d total=%d capacity=%u at=%lu\n",
+                (unsigned long)generation, count, dropped, n, BRIDGE_SCAN_CAPACITY,
+                (unsigned long)now);
+  pbble::heapProbe("scan-complete");
+}
+static void coldBlueMain() {
+  pbble::heapProbe("cold-boot");
+  // The panel retains its pixels while both radios change state. Draw once,
+  // directly from the original four-colour mascot. No menu, touch task or sprite.
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+  ws_c5_exio_begin();
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(colorBG());
+  const int scale = min(tft.width() / PIG_SPRITE_W, tft.height() / PIG_SPRITE_H);
+  Avatar::drawSpriteBitmap(tft, PIG_SPRITES[2][0],
+      (tft.width() - scale * PIG_SPRITE_W) / 2,
+      (tft.height() - scale * PIG_SPRITE_H) / 2,
+      scale, PIG_SPRITE_W, PIG_SPRITE_H);
+  pbble::heapProbe("bridge-image");
+  const bool buffersReady = initBridgeScanBuffers();
+  if (buffersReady) pbble::setApProvider(coldRealProvider);
+  WiFi.persistent(false);
+#if defined(PB_WIFI_BOOT_TEST)
+  bridgeScanPaused = true;
+  const bool wifiReady = buffersReady;
+#else
+  const bool wifiReady = buffersReady && WiFi.mode(WIFI_STA);
+#endif
+  pbble::heapProbe("bridge-wifi");
+  delay(2000); // Let WiFi startup settle before BLE can accept a phone.
+  const bool bleReady = wifiReady && pbble::setEnabled(true);
+  pbble::heapProbe("cold-post-ble");
+  if (!wifiReady || !bleReady) {
+    tft.setTextDatum(BC_DATUM);
+    tft.drawString("Bridge unavailable - reset to exit", tft.width()/2, tft.height()-8);
+  }
+  for (;;) {
+    const uint32_t now = millis();
+#if defined(PB_BRIDGE_DIAGNOSTICS)
+    if (Serial.available()) {
+      const char control = Serial.read();
+      if (control == 'o') {
+        bridgeScanPaused = true;
+        WiFi.mode(WIFI_OFF);
+        Serial.println("[blues] WiFi fully off");
+      }
+      if (control == 'p' || control == 'r') {
+        if (control == 'r') WiFi.mode(WIFI_STA);
+        bridgeScanPaused = control == 'p';
+        Serial.printf("[blues] scan-control paused=%d at=%lu\n", bridgeScanPaused, (unsigned long)now);
+      }
+    }
+#endif
+    if (wifiReady) pollBridgeScan(now);
+    if (bleReady) pbble::tick(now);
+    delay(5);
+  }
+}
+#endif
+
 void setup() {
   // Explicit rather than relying on the IDE's board-menu CPU frequency
   // setting — 240MHz is the ESP32's actual rated maximum; there's no
@@ -12771,6 +13071,16 @@ void setup() {
   Serial.println("\n=== PORKCHOP C5 v6 STARTING (Waveshare ESP32-C5-Touch-LCD-3.5) ===");
   Serial.printf("[HEAP] startup: free=%u largest=%u\n", ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
+#if defined(PIGGYBLUES_BLE) && !defined(PB_BRIDGE_NORMAL_MODE)
+  // One-shot bridge gate. Clear the flag first (crash-loop safe), then enter
+  // the dedicated pig-screen + Wi-Fi scan + BLE path and never return.
+  { Preferences cp; cp.begin("bluesx", false);
+    bool cold = cp.getBool("cold", false);
+    if (cold) cp.putBool("cold", false);
+    cp.end();
+    if (cold) coldBlueMain();  // deferred: no display/SD/GPS/audio/WiFi init below
+  }
+#endif
 
   // SD CS high (prevent SPI bus issues)
   pinMode(SD_CS_PIN,OUTPUT); digitalWrite(SD_CS_PIN,HIGH);
@@ -12827,6 +13137,18 @@ void setup() {
   // WiFi — after SD
   WiFi.persistent(false); WiFi.mode(WIFI_STA); WiFi.disconnect(true,false);
   WiFi.setSleep(false); delay(200);
+
+#if defined(PIGGYBLUES_BLE) && defined(PB_BRIDGE_NORMAL_MODE)
+  // Reserve controller, host and advertiser memory before the remaining normal
+  // firmware allocations fragment internal RAM. Keep it undiscoverable until
+  // setup is complete so a phone cannot connect during blocking peripherals.
+  PiggyBlues::initNormalCatalog();
+  pbble::setAdvertisingAllowed(false);
+  pbble::setApProvider(PiggyBlues::apProvider);
+  const bool normalBridgeReady = pbble::setEnabled(true);
+  pbble::heapProbe(normalBridgeReady ? "normal-ble-ok" : "normal-ble-fail");
+  Serial.printf("[blues] normal-mode bridge ready=%d\n", int(normalBridgeReady));
+#endif
 
   loadConfig();
   tft.setRotation(cfg.screenRotation); // apply saved rotation now that config is loaded
@@ -12908,6 +13230,10 @@ void setup() {
   Serial.printf("[BOOT] Free heap: %u largest: %u\n",
                 ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   Serial.println("=== PORKCHOP C5 v6 READY ===");
+#if defined(PIGGYBLUES_BLE) && defined(PB_BRIDGE_NORMAL_MODE)
+  pbble::setAdvertisingAllowed(true);
+  Serial.println("[blues] normal-mode advertising released after READY");
+#endif
   // Apply ghost mode if it was saved on
   if (cfg.ghostMode) {
     GhostMode::apply();
@@ -13063,6 +13389,12 @@ void loop() {
       if(!scanInProgress && millis()-lastScanTime>SCAN_INTERVAL_MS) startScan();
       break;
   }
+
+#if defined(PIGGYBLUES_BLE) && defined(PB_BRIDGE_NORMAL_MODE)
+  // Keep the bridge alive behind every visible UI mode.
+  PiggyBlues::harvestNormalCatalog(millis());
+  if (pbble::enabled()) pbble::tick(millis());
+#endif
 
   Mood::update();
   // Deferred achievement from riddle system (Mood can't call XP directly due to declaration order)
